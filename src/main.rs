@@ -51,10 +51,6 @@ struct Args {
     /// Number of worker threads [default: CPU core count]
     #[arg(long, short = 't')]
     threads: Option<usize>,
-
-    /// Directory to save found wallet JSON files
-    #[arg(long, short = 'o', default_value = ".")]
-    output: String,
 }
 
 #[derive(Serialize)]
@@ -80,7 +76,15 @@ fn format_count(n: u64) -> String {
 }
 
 fn format_duration(secs: u64) -> String {
-    if secs >= 3600 {
+    if secs >= 86400 {
+        format!(
+            "{}d {:02}h {:02}m {:02}s",
+            secs / 86400,
+            (secs % 86400) / 3600,
+            (secs % 3600) / 60,
+            secs % 60
+        )
+    } else if secs >= 3600 {
         format!(
             "{}h {:02}m {:02}s",
             secs / 3600,
@@ -116,7 +120,10 @@ fn main() {
 
     if !args.prefix.is_empty() {
         if let Err(c) = validate_pattern(&args.prefix) {
-            eprintln!("error: prefix contains '{}' which is not a valid base58 character", c);
+            eprintln!(
+                "error: prefix contains '{}' which is not a valid base58 character",
+                c
+            );
             eprintln!("       base58 excludes: 0 (zero), O (uppercase o), I (uppercase i), l (lowercase L)");
             std::process::exit(1);
         }
@@ -124,15 +131,42 @@ fn main() {
 
     if !args.suffix.is_empty() {
         if let Err(c) = validate_pattern(&args.suffix) {
-            eprintln!("error: suffix contains '{}' which is not a valid base58 character", c);
+            eprintln!(
+                "error: suffix contains '{}' which is not a valid base58 character",
+                c
+            );
             eprintln!("       base58 excludes: 0 (zero), O (uppercase o), I (uppercase i), l (lowercase L)");
             std::process::exit(1);
         }
     }
 
-    if args.output != "." {
-        fs::create_dir_all(&args.output).expect("failed to create output directory");
-    }
+    let output_dir = {
+        let mut parts = Vec::new();
+        if !args.prefix.is_empty() {
+            parts.push(format!("{}-prefix", args.prefix.to_lowercase()));
+        }
+        if !args.suffix.is_empty() {
+            parts.push(format!("{}-suffix", args.suffix.to_lowercase()));
+        }
+        format!("wallets/{}", parts.join("-"))
+    };
+
+    fs::create_dir_all(&output_dir).unwrap_or_else(|e| {
+        let hint = match e.kind() {
+            io::ErrorKind::PermissionDenied => "check directory permissions",
+            _ => {
+                if std::path::Path::new("wallets").exists()
+                    && !std::path::Path::new("wallets").is_dir()
+                {
+                    "a file named 'wallets' exists and is not a directory"
+                } else {
+                    "check disk space and filesystem"
+                }
+            }
+        };
+        eprintln!("error: failed to create '{}: {} ({})", output_dir, e, hint);
+        std::process::exit(1);
+    });
 
     let num_threads = args.threads.unwrap_or_else(|| {
         thread::available_parallelism()
@@ -166,14 +200,14 @@ fn main() {
         format_count(expected as u64)
     );
     eprintln!("  threads:    {}", num_threads);
-    eprintln!("  output:     {}/", args.output);
+    eprintln!("  output:     {}/", output_dir);
     eprintln!();
 
     // Spawn worker threads
     for _ in 0..num_threads {
         let prefix_lower = prefix_lower.clone();
         let suffix_lower = suffix_lower.clone();
-        let output_dir = args.output.clone();
+        let output_dir = output_dir.clone();
         let counter = counter.clone();
         let found = found.clone();
 
@@ -202,10 +236,8 @@ fn main() {
                 let address = bs58::encode(&combined).into_string();
                 let addr_lower = address.to_ascii_lowercase();
 
-                let prefix_ok =
-                    prefix_lower.is_empty() || addr_lower.starts_with(&prefix_lower);
-                let suffix_ok =
-                    suffix_lower.is_empty() || addr_lower.ends_with(&suffix_lower);
+                let prefix_ok = prefix_lower.is_empty() || addr_lower.starts_with(&prefix_lower);
+                let suffix_ok = suffix_lower.is_empty() || addr_lower.ends_with(&suffix_lower);
 
                 if prefix_ok && suffix_ok {
                     let wallet = VanityWallet {
@@ -247,21 +279,19 @@ fn main() {
         let count = counter.load(Ordering::Relaxed);
         let elapsed = start.elapsed();
         let secs = elapsed.as_secs_f64();
-        let rate = if secs > 0.0 {
-            count as f64 / secs
-        } else {
-            0.0
-        };
+        let rate = if secs > 0.0 { count as f64 / secs } else { 0.0 };
+        let estimate = if rate > 0.0 { (expected / rate) as u64 } else { 0 };
         let found_n = found.load(Ordering::Relaxed);
 
         let mut handle = stderr.lock();
         let _ = write!(
             handle,
-            "\r\x1b[K  {} keys | {:.0}/s | {} found | {}",
+            "\r\x1b[K  {} keys | {:.0}/s | {} found | {} ({} estimated)",
             format_count(count),
             rate,
             found_n,
             format_duration(elapsed.as_secs()),
+            format_duration(estimate),
         );
         let _ = handle.flush();
     }
