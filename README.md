@@ -43,6 +43,25 @@ Or without make:
 cargo build --release
 ```
 
+### linux + nvidia cuda (experimental hybrid backend)
+
+Requires CUDA toolkit (`nvcc`) and NVIDIA driver.
+
+```
+cargo build --release --features cuda
+./target/release/blocknet-vanity --prefix abc --cuda
+```
+
+Using make:
+
+```
+make all
+./blocknet-vanity --prefix abc --cuda
+```
+
+`make all` auto-detects CUDA on Linux when `nvcc` is installed.  
+Optional overrides: `make all CUDA=1` (force CUDA) or `make all CUDA=0` (force CPU).
+
 ## run
 
 ```
@@ -55,6 +74,7 @@ cargo build --release
 --prefix <str>      prefix the address must start with (case-insensitive)
 --suffix <str>      suffix the address must end with (case-insensitive)
 -t, --threads <N>   number of worker threads (default: CPU core count)
+--cuda              request hybrid CUDA backend (requires Linux build with --features cuda)
 -o, --output <dir>  directory to save wallet JSON files (default: .)
 ```
 
