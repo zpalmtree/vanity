@@ -317,15 +317,12 @@ __device__ void fe_pow22523(fe25519* h, const fe25519* f) {
     fe_mul(h, &t0, f);        // h  = f^(2^252-3)
 }
 
-// fe_equal: returns 1 if f == g - reduced limb XOR avoids 2x fe_tobytes
+// fe_equal: returns 1 if f == g - uses subtraction + single reduce
 __device__ int fe_equal(const fe25519* f, const fe25519* g) {
-    fe25519 tf, tg;
-    fe_copy(&tf, f);
-    fe_copy(&tg, g);
-    fe_reduce(&tf);
-    fe_reduce(&tg);
-    u64 d = 0;
-    for (int i = 0; i < 5; i++) d |= tf.v[i] ^ tg.v[i];
+    fe25519 diff;
+    fe_sub(&diff, f, g);   // diff = f - g + 2p (always positive)
+    fe_reduce(&diff);
+    u64 d = diff.v[0] | diff.v[1] | diff.v[2] | diff.v[3] | diff.v[4];
     return d == 0;
 }
 
@@ -669,6 +666,7 @@ __global__ void __launch_bounds__(256, 2) vanity_kernel(
     // Range-based matching (replaces base58 encoding)
     const uint8_t* prefix_ranges, int num_prefix_ranges,
     u64 suffix_modulus, const u64* suffix_targets, int num_suffix_targets,
+    u64 suffix_shift_mod, u64 suffix_view_offset,
     // Batch: total number of keys (must be multiple of KEYS_PER_THREAD)
     int batch_size,
     // Output: flags (1=match, 0=no match), indexed by key_index [0..batch_size)
@@ -742,7 +740,6 @@ __global__ void __launch_bounds__(256, 2) vanity_kernel(
             const uint8_t* lo = prefix_ranges + r * 128;
             const uint8_t* hi = lo + 64;
             // Big-endian comparison: check lo <= combined < hi
-            // First check: combined >= lo (early exit on first differing byte)
             bool ge_lo = true;
             bool lt_hi = true;
             bool lo_decided = false;
@@ -764,13 +761,14 @@ __global__ void __launch_bounds__(256, 2) vanity_kernel(
         // SUFFIX CHECK: modular arithmetic (only if prefix matched)
         bool suffix_ok = (num_suffix_targets == 0);  // no suffix = always match
         if (prefix_ok && !suffix_ok) {
-            // Compute combined mod suffix_modulus
-            // combined is 64 bytes big-endian = a 512-bit number
-            // mod_val = combined mod suffix_modulus
-            u64 mod_val = 0;
-            for (int i = 0; i < 64; i++) {
-                mod_val = (mod_val * 256 + combined[i]) % suffix_modulus;
+            // Half-length loop: only spend_pub (32 bytes), precomputed view_pub contribution
+            // combined mod m = (spend_mod * shift_mod + view_offset) mod m
+            u64 spend_mod = 0;
+            for (int i = 0; i < 32; i++) {
+                spend_mod = (spend_mod * 256 + spend_pub[i]) % suffix_modulus;
             }
+            // For suffix_len <= 5: both values < 2^30, product < 2^60, fits in u64
+            u64 mod_val = (spend_mod * suffix_shift_mod + suffix_view_offset) % suffix_modulus;
             for (int t = 0; t < num_suffix_targets; t++) {
                 if (mod_val == suffix_targets[t]) { suffix_ok = true; break; }
             }
@@ -802,6 +800,8 @@ struct CudaWorker {
     u64 suffix_modulus;           // 58^suffix_len, or 0 if no suffix
     u64* d_suffix_targets;        // array of valid mod targets
     int num_suffix_targets;
+    u64 suffix_shift_mod;         // 256^32 mod suffix_modulus (for half-length loop)
+    u64 suffix_view_offset;       // view_pub_as_bigendian mod suffix_modulus
 
     // Legacy mode device memory
     uint8_t* d_inputs;
@@ -852,6 +852,8 @@ extern "C" void* cuda_worker_create(
     w->suffix_modulus = 0;
     w->d_suffix_targets = nullptr;
     w->num_suffix_targets = 0;
+    w->suffix_shift_mod = 0;
+    w->suffix_view_offset = 0;
 
     cudaStreamCreate(&w->stream);
 
@@ -892,7 +894,9 @@ extern "C" int cuda_worker_set_ranges(
     void* handle,
     const uint8_t* prefix_ranges, int num_prefix_ranges,  // num_prefix_ranges * 128 bytes
     u64 suffix_modulus,
-    const u64* suffix_targets, int num_suffix_targets
+    const u64* suffix_targets, int num_suffix_targets,
+    u64 suffix_shift_mod,       // 256^32 mod suffix_modulus
+    u64 suffix_view_offset      // view_pub_as_bigendian mod suffix_modulus
 ) {
     CudaWorker* w = (CudaWorker*)handle;
 
@@ -903,6 +907,8 @@ extern "C" int cuda_worker_set_ranges(
     w->num_prefix_ranges = num_prefix_ranges;
     w->suffix_modulus = suffix_modulus;
     w->num_suffix_targets = num_suffix_targets;
+    w->suffix_shift_mod = suffix_shift_mod;
+    w->suffix_view_offset = suffix_view_offset;
 
     // Allocate and copy prefix ranges
     if (num_prefix_ranges > 0) {
@@ -958,6 +964,7 @@ extern "C" int cuda_worker_submit_v2(
         w->d_view_pub,
         w->d_prefix_ranges, w->num_prefix_ranges,
         w->suffix_modulus, w->d_suffix_targets, w->num_suffix_targets,
+        w->suffix_shift_mod, w->suffix_view_offset,
         count,
         w->d_flags
     );
