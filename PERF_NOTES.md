@@ -83,3 +83,38 @@ Observed medians:
 
 ## Notes on noise
 Desktop GPU processes (Xorg/browser/Discord) were active during runs, so single-run throughput is noisy. Median-over-repeats was used to pick default guidance.
+
+## 2026-02-15 strict interleaved A/B (baseline commit vs candidate)
+
+### Why this run
+Earlier short-window snapshots mixed peak and last-sample reporting and were noisy. This pass used a stricter methodology to reduce ordering and thermal bias.
+
+### Method
+- Baseline: commit `e66cf8f`
+- Candidate: commit `cf94dfd`
+- Interleaved pair order: alternating baseline-first / candidate-first
+- Warmup: 12s per variant per mode
+- Measured window: 30s
+- Cooldown: 20s between runs
+- Pairs: 4 per mode
+- Fixed settings: `--cuda -t 2 --batch-size 8388608`
+- Metrics captured per run: last / median / mean / max (from progress samples)
+- Raw CSV: `/tmp/vanity_ab_strict.csv`
+
+### Aggregate (measured pairs only)
+- Prefix baseline avg median: `59,355,107/s`
+- Prefix candidate avg median: `71,600,234/s`
+- Prefix delta: `+12,245,127/s` (`+20.63%`)
+- Suffix baseline avg median: `66,281,124/s`
+- Suffix candidate avg median: `70,166,250/s`
+- Suffix delta: `+3,885,126/s` (`+5.86%`)
+
+### Pairwise deltas (median, candidate - baseline)
+- Prefix pair 1: `+15.76%`
+- Prefix pair 2: `+22.60%`
+- Prefix pair 3: `+36.36%`
+- Prefix pair 4: `+10.74%`
+- Suffix pair 1: `+9.66%`
+- Suffix pair 2: `+1.84%`
+- Suffix pair 3: `+12.68%`
+- Suffix pair 4: `+0.11%`
