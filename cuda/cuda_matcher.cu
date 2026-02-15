@@ -666,9 +666,9 @@ __global__ void __launch_bounds__(256, 2) vanity_kernel(
     const u64* start_X, const u64* start_Y, const u64* start_Z, const u64* start_T,
     // View public key (compressed, 32 bytes) - constant across batch
     const uint8_t* view_pub,
-    // Pattern matching
-    const char* prefix_lower, int prefix_len,
-    const char* suffix_lower, int suffix_len,
+    // Range-based matching (replaces base58 encoding)
+    const uint8_t* prefix_ranges, int num_prefix_ranges,
+    u64 suffix_modulus, const u64* suffix_targets, int num_suffix_targets,
     // Batch: total number of keys (must be multiple of KEYS_PER_THREAD)
     int batch_size,
     // Output: flags (1=match, 0=no match), indexed by key_index [0..batch_size)
@@ -735,29 +735,44 @@ __global__ void __launch_bounds__(256, 2) vanity_kernel(
         for (int i = 0; i < 32; i++) combined[i] = spend_pub[i];
         for (int i = 0; i < 32; i++) combined[32 + i] = view_pub[i];
 
-        // Base58 encode
-        char addr[96];
-        int addr_len = encode_base58_64(combined, addr);
-
-        // Pattern matching
-        bool prefix_ok = true;
-        if (prefix_len > 0) {
-            if (prefix_len > addr_len) { prefix_ok = false; }
-            else {
-                for (int i = 0; i < prefix_len; ++i) {
-                    if (ascii_lower(addr[i]) != prefix_lower[i]) { prefix_ok = false; break; }
+        // PREFIX CHECK: byte comparison against precomputed ranges
+        // Check if combined falls within any [lo, hi) range
+        bool prefix_ok = (num_prefix_ranges == 0);  // no prefix = always match
+        for (int r = 0; r < num_prefix_ranges && !prefix_ok; r++) {
+            const uint8_t* lo = prefix_ranges + r * 128;
+            const uint8_t* hi = lo + 64;
+            // Big-endian comparison: check lo <= combined < hi
+            // First check: combined >= lo (early exit on first differing byte)
+            bool ge_lo = true;
+            bool lt_hi = true;
+            bool lo_decided = false;
+            bool hi_decided = false;
+            for (int i = 0; i < 64; i++) {
+                if (!lo_decided) {
+                    if (combined[i] < lo[i]) { ge_lo = false; lo_decided = true; hi_decided = true; break; }
+                    if (combined[i] > lo[i]) { lo_decided = true; }
                 }
+                if (!hi_decided) {
+                    if (combined[i] < hi[i]) { lt_hi = true; hi_decided = true; }
+                    else if (combined[i] > hi[i]) { lt_hi = false; hi_decided = true; }
+                }
+                if (lo_decided && hi_decided) break;
             }
+            prefix_ok = ge_lo && lt_hi;
         }
 
-        bool suffix_ok = true;
-        if (prefix_ok && suffix_len > 0) {
-            if (suffix_len > addr_len) { suffix_ok = false; }
-            else {
-                int start = addr_len - suffix_len;
-                for (int i = 0; i < suffix_len; ++i) {
-                    if (ascii_lower(addr[start + i]) != suffix_lower[i]) { suffix_ok = false; break; }
-                }
+        // SUFFIX CHECK: modular arithmetic (only if prefix matched)
+        bool suffix_ok = (num_suffix_targets == 0);  // no suffix = always match
+        if (prefix_ok && !suffix_ok) {
+            // Compute combined mod suffix_modulus
+            // combined is 64 bytes big-endian = a 512-bit number
+            // mod_val = combined mod suffix_modulus
+            u64 mod_val = 0;
+            for (int i = 0; i < 64; i++) {
+                mod_val = (mod_val * 256 + combined[i]) % suffix_modulus;
+            }
+            for (int t = 0; t < num_suffix_targets; t++) {
+                if (mod_val == suffix_targets[t]) { suffix_ok = true; break; }
             }
         }
 
@@ -780,6 +795,13 @@ struct CudaWorker {
     char* d_prefix;
     char* d_suffix;
     uint8_t* d_flags;
+
+    // Range-based matching (replaces base58 encoding on GPU)
+    uint8_t* d_prefix_ranges;    // num_prefix_ranges * 128 bytes (lo[64] || hi[64])
+    int num_prefix_ranges;
+    u64 suffix_modulus;           // 58^suffix_len, or 0 if no suffix
+    u64* d_suffix_targets;        // array of valid mod targets
+    int num_suffix_targets;
 
     // Legacy mode device memory
     uint8_t* d_inputs;
@@ -824,6 +846,13 @@ extern "C" void* cuda_worker_create(
     w->suffix_len = suffix_len;
     w->mode = mode;
 
+    // Initialize range fields
+    w->d_prefix_ranges = nullptr;
+    w->num_prefix_ranges = 0;
+    w->suffix_modulus = 0;
+    w->d_suffix_targets = nullptr;
+    w->num_suffix_targets = 0;
+
     cudaStreamCreate(&w->stream);
 
     // Allocate persistent device memory
@@ -858,6 +887,44 @@ extern "C" void* cuda_worker_create(
     return w;
 }
 
+// Set precomputed ranges for range-based matching (replaces base58 on GPU)
+extern "C" int cuda_worker_set_ranges(
+    void* handle,
+    const uint8_t* prefix_ranges, int num_prefix_ranges,  // num_prefix_ranges * 128 bytes
+    u64 suffix_modulus,
+    const u64* suffix_targets, int num_suffix_targets
+) {
+    CudaWorker* w = (CudaWorker*)handle;
+
+    // Free any previous range allocations
+    if (w->d_prefix_ranges) cudaFree(w->d_prefix_ranges);
+    if (w->d_suffix_targets) cudaFree(w->d_suffix_targets);
+
+    w->num_prefix_ranges = num_prefix_ranges;
+    w->suffix_modulus = suffix_modulus;
+    w->num_suffix_targets = num_suffix_targets;
+
+    // Allocate and copy prefix ranges
+    if (num_prefix_ranges > 0) {
+        size_t range_size = (size_t)num_prefix_ranges * 128;
+        if (cudaMalloc(&w->d_prefix_ranges, range_size) != cudaSuccess) return 1;
+        if (cudaMemcpy(w->d_prefix_ranges, prefix_ranges, range_size, cudaMemcpyHostToDevice) != cudaSuccess) return 2;
+    } else {
+        w->d_prefix_ranges = nullptr;
+    }
+
+    // Allocate and copy suffix targets
+    if (num_suffix_targets > 0) {
+        size_t targets_size = (size_t)num_suffix_targets * sizeof(u64);
+        if (cudaMalloc(&w->d_suffix_targets, targets_size) != cudaSuccess) return 3;
+        if (cudaMemcpy(w->d_suffix_targets, suffix_targets, targets_size, cudaMemcpyHostToDevice) != cudaSuccess) return 4;
+    } else {
+        w->d_suffix_targets = nullptr;
+    }
+
+    return 0;
+}
+
 // Full GPU mode: submit a batch with starting point coordinates
 extern "C" int cuda_worker_submit_v2(
     void* handle,
@@ -889,8 +956,8 @@ extern "C" int cuda_worker_submit_v2(
     vanity_kernel<<<blocks, threads, 0, s>>>(
         w->d_start_X, w->d_start_Y, w->d_start_Z, w->d_start_T,
         w->d_view_pub,
-        w->d_prefix, w->prefix_len,
-        w->d_suffix, w->suffix_len,
+        w->d_prefix_ranges, w->num_prefix_ranges,
+        w->suffix_modulus, w->d_suffix_targets, w->num_suffix_targets,
         count,
         w->d_flags
     );
@@ -944,6 +1011,8 @@ extern "C" void cuda_worker_destroy(void* handle) {
     if (w->d_start_Z) cudaFree(w->d_start_Z);
     if (w->d_start_T) cudaFree(w->d_start_T);
     if (w->d_view_pub) cudaFree(w->d_view_pub);
+    if (w->d_prefix_ranges) cudaFree(w->d_prefix_ranges);
+    if (w->d_suffix_targets) cudaFree(w->d_suffix_targets);
     cudaFree(w->d_flags);
     cudaFree(w->d_prefix);
     cudaFree(w->d_suffix);

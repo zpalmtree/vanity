@@ -17,6 +17,7 @@ use rand::RngCore;
 use serde::Serialize;
 
 const BASE58_ALPHABET: &str = "123456789ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz";
+const BASE58_CHARS: &[u8] = BASE58_ALPHABET.as_bytes();
 
 /// Maximum number of generator table entries (supports batch up to 2^TABLE_BITS)
 const TABLE_BITS: usize = 24;
@@ -61,6 +62,241 @@ struct SearchConfig {
     suffix_lower: String,
     threads: usize,
     batch_size: usize,
+}
+
+// ============================================================================
+// U512 big-endian arithmetic helpers (for range precomputation at startup)
+// ============================================================================
+
+/// Multiply a 64-byte big-endian number by a small u32 constant, in-place.
+/// Returns true if the result overflowed (didn't fit in 64 bytes).
+fn u512_mul_small(a: &mut [u8; 64], m: u32) -> bool {
+    let mut carry: u64 = 0;
+    for i in (0..64).rev() {
+        let prod = a[i] as u64 * m as u64 + carry;
+        a[i] = prod as u8;
+        carry = prod >> 8;
+    }
+    carry != 0
+}
+
+/// Add a single byte value to a 64-byte big-endian number, in-place.
+fn u512_add_small(a: &mut [u8; 64], v: u8) {
+    let mut carry = v as u16;
+    for i in (0..64).rev() {
+        let sum = a[i] as u16 + carry;
+        a[i] = sum as u8;
+        carry = sum >> 8;
+        if carry == 0 {
+            break;
+        }
+    }
+}
+
+/// Add two 64-byte big-endian numbers, returning the result (ignoring overflow).
+fn u512_add(a: &[u8; 64], b: &[u8; 64]) -> [u8; 64] {
+    let mut result = [0u8; 64];
+    let mut carry: u16 = 0;
+    for i in (0..64).rev() {
+        let sum = a[i] as u16 + b[i] as u16 + carry;
+        result[i] = sum as u8;
+        carry = sum >> 8;
+    }
+    result
+}
+
+/// Compare two 64-byte big-endian numbers: returns Ordering.
+fn u512_cmp(a: &[u8; 64], b: &[u8; 64]) -> std::cmp::Ordering {
+    for i in 0..64 {
+        match a[i].cmp(&b[i]) {
+            std::cmp::Ordering::Equal => continue,
+            other => return other,
+        }
+    }
+    std::cmp::Ordering::Equal
+}
+
+// ============================================================================
+// Range computation for prefix/suffix matching without base58 encoding
+// ============================================================================
+
+/// Map a lowercase ASCII character to its base58 digit value(s).
+/// Returns the possible digit values for case-insensitive matching.
+/// For digits (1-9): single value. For letters: up to 2 values (upper + lower).
+fn base58_char_values(c: u8) -> Vec<u8> {
+    let mut values = Vec::new();
+    for (i, &ch) in BASE58_CHARS.iter().enumerate() {
+        if ch.to_ascii_lowercase() == c {
+            values.push(i as u8);
+        }
+    }
+    values
+}
+
+/// Compute the numeric ranges [lo, hi) of 64-byte big-endian values whose
+/// base58 encoding starts with the given case-insensitive prefix.
+///
+/// Returns a sorted, merged list of non-overlapping ranges.
+#[cfg(any(feature = "cuda", test))]
+fn compute_prefix_ranges(prefix_lower: &str) -> Vec<([u8; 64], [u8; 64])> {
+    if prefix_lower.is_empty() {
+        return vec![];
+    }
+
+    let prefix_bytes = prefix_lower.as_bytes();
+
+    // For each position, get the possible base58 digit values
+    let digit_options: Vec<Vec<u8>> = prefix_bytes
+        .iter()
+        .map(|&c| base58_char_values(c))
+        .collect();
+
+    // Generate all case combinations via Cartesian product
+    let mut combos: Vec<Vec<u8>> = vec![vec![]];
+    for opts in &digit_options {
+        let mut new_combos = Vec::new();
+        for combo in &combos {
+            for &opt in opts {
+                let mut new = combo.clone();
+                new.push(opt);
+                new_combos.push(new);
+            }
+        }
+        combos = new_combos;
+    }
+
+    let p = prefix_bytes.len();
+    let mut ranges: Vec<([u8; 64], [u8; 64])> = Vec::new();
+
+    // 2^512 as a ceiling (all 0xFF bytes = max value, but actual max is 2^512-1)
+    let max_val = [0xFFu8; 64];
+
+    // Base58 encoding of 64 bytes produces 87 or 88 characters
+    for addr_len in [87usize, 88] {
+        if p > addr_len {
+            continue;
+        }
+        let remaining = addr_len - p;
+
+        // Precompute 58^remaining (shared across combos for this addr_len)
+        let mut power = [0u8; 64];
+        power[63] = 1;
+        let mut power_overflow = false;
+        for _ in 0..remaining {
+            power_overflow |= u512_mul_small(&mut power, 58);
+        }
+        if power_overflow {
+            continue; // 58^remaining doesn't fit; skip this addr_len
+        }
+
+        for combo in &combos {
+            // Compute lo = d[0]*58^(L-1) + d[1]*58^(L-2) + ... + d[P-1]*58^(L-P)
+            // Using Horner's method: val = ((d[0]*58 + d[1])*58 + d[2])*58 + ...
+            // then multiply by 58^(L-P)
+            let mut lo = [0u8; 64];
+            let mut overflow = false;
+            for &d in combo {
+                overflow |= u512_mul_small(&mut lo, 58);
+                u512_add_small(&mut lo, d);
+            }
+            // Multiply by 58^remaining
+            for _ in 0..remaining {
+                overflow |= u512_mul_small(&mut lo, 58);
+            }
+
+            // Skip if lo computation overflowed
+            if overflow {
+                continue;
+            }
+
+            // hi = lo + 58^remaining
+            let hi = u512_add(&lo, &power);
+
+            // Cap hi at max_val if it overflowed (wrapped to smaller value)
+            let clamped_hi = if u512_cmp(&hi, &lo) == std::cmp::Ordering::Less {
+                // Addition wrapped around
+                max_val
+            } else {
+                hi
+            };
+
+            if u512_cmp(&lo, &clamped_hi) == std::cmp::Ordering::Less {
+                ranges.push((lo, clamped_hi));
+            }
+        }
+    }
+
+    // Sort by lo
+    ranges.sort_by(|a, b| u512_cmp(&a.0, &b.0));
+
+    // Merge overlapping ranges
+    let mut merged: Vec<([u8; 64], [u8; 64])> = Vec::new();
+    for (lo, hi) in ranges {
+        if let Some(last) = merged.last_mut() {
+            // If current lo <= last hi, merge
+            if u512_cmp(&lo, &last.1) != std::cmp::Ordering::Greater {
+                if u512_cmp(&hi, &last.1) == std::cmp::Ordering::Greater {
+                    last.1 = hi;
+                }
+                continue;
+            }
+        }
+        merged.push((lo, hi));
+    }
+
+    merged
+}
+
+/// Compute suffix matching targets: returns (modulus, targets) where
+/// modulus = 58^suffix_len and targets are the valid remainder values.
+#[cfg(any(feature = "cuda", test))]
+fn compute_suffix_targets(suffix_lower: &str) -> (u64, Vec<u64>) {
+    if suffix_lower.is_empty() {
+        return (0, vec![]);
+    }
+
+    let suffix_bytes = suffix_lower.as_bytes();
+    let s = suffix_bytes.len();
+
+    // modulus = 58^s
+    let mut modulus: u64 = 1;
+    for _ in 0..s {
+        modulus = modulus.checked_mul(58).expect("suffix too long for u64 modulus");
+    }
+
+    // Enumerate case combinations
+    let digit_options: Vec<Vec<u8>> = suffix_bytes
+        .iter()
+        .map(|&c| base58_char_values(c))
+        .collect();
+
+    let mut combos: Vec<Vec<u8>> = vec![vec![]];
+    for opts in &digit_options {
+        let mut new_combos = Vec::new();
+        for combo in &combos {
+            for &opt in opts {
+                let mut new = combo.clone();
+                new.push(opt);
+                new_combos.push(new);
+            }
+        }
+        combos = new_combos;
+    }
+
+    let mut targets: Vec<u64> = Vec::new();
+    for combo in &combos {
+        // target = d[0]*58^(s-1) + d[1]*58^(s-2) + ... + d[s-1]
+        let mut val: u64 = 0;
+        for &d in combo {
+            val = val * 58 + d as u64;
+        }
+        if !targets.contains(&val) {
+            targets.push(val);
+        }
+    }
+    targets.sort();
+
+    (modulus, targets)
 }
 
 trait SearchBackend: Send {
@@ -181,6 +417,15 @@ unsafe extern "C" {
         suffix_len: i32,
         mode: i32,
     ) -> *mut std::ffi::c_void;
+
+    fn cuda_worker_set_ranges(
+        handle: *mut std::ffi::c_void,
+        prefix_ranges: *const u8,
+        num_prefix_ranges: i32,
+        suffix_modulus: u64,
+        suffix_targets: *const u64,
+        num_suffix_targets: i32,
+    ) -> i32;
 
     fn cuda_worker_submit_v2(
         handle: *mut std::ffi::c_void,
@@ -350,10 +595,33 @@ impl SearchBackend for CudaBackend {
             // 2-4 allows pipelining while one kernel runs
             let worker_count = config.threads.min(4).max(1);
 
+            // Precompute ranges on CPU (once, shared by all workers)
+            let prefix_ranges = compute_prefix_ranges(&config.prefix_lower);
+            let (suffix_modulus, suffix_targets) = compute_suffix_targets(&config.suffix_lower);
+
+            // Flatten prefix ranges into contiguous bytes: [lo0[64] hi0[64] lo1[64] hi1[64] ...]
+            let prefix_ranges_flat: Vec<u8> = prefix_ranges
+                .iter()
+                .flat_map(|(lo, hi)| lo.iter().chain(hi.iter()).copied())
+                .collect();
+
+            eprintln!(
+                "  range matching: {} prefix ranges, {} suffix targets (mod {})",
+                prefix_ranges.len(),
+                suffix_targets.len(),
+                suffix_modulus
+            );
+
+            let prefix_ranges_flat = Arc::new(prefix_ranges_flat);
+            let suffix_targets = Arc::new(suffix_targets);
+            let num_prefix_ranges = prefix_ranges.len() as i32;
+
             for _ in 0..worker_count {
                 let config = config.clone();
                 let match_tx = match_tx.clone();
                 let counter = counter.clone();
+                let prefix_ranges_flat = prefix_ranges_flat.clone();
+                let suffix_targets = suffix_targets.clone();
 
                 thread::spawn(move || {
                     let mut rng = rand::thread_rng();
@@ -390,6 +658,22 @@ impl SearchBackend for CudaBackend {
                         return;
                     }
 
+                    // Upload precomputed ranges to GPU
+                    let rc = unsafe {
+                        cuda_worker_set_ranges(
+                            handle,
+                            if prefix_ranges_flat.is_empty() { std::ptr::null() } else { prefix_ranges_flat.as_ptr() },
+                            num_prefix_ranges,
+                            suffix_modulus,
+                            if suffix_targets.is_empty() { std::ptr::null() } else { suffix_targets.as_ptr() },
+                            suffix_targets.len() as i32,
+                        )
+                    };
+                    if rc != 0 {
+                        eprintln!("cuda_worker_set_ranges failed with code {}", rc);
+                        return;
+                    }
+
                     let mut flags = vec![0u8; batch_size];
 
                     loop {
@@ -397,7 +681,7 @@ impl SearchBackend for CudaBackend {
                         let coords = extract_point_coords(&spend_pub_point);
 
                         // Submit to GPU: GPU does point addition + Ristretto compression +
-                        // Base58 encoding + pattern matching for all batch_size candidates
+                        // range-based pattern matching for all batch_size candidates
                         let rc = unsafe {
                             cuda_worker_submit_v2(
                                 handle,
@@ -611,6 +895,13 @@ fn main() {
             eprintln!("       base58 excludes: 0 (zero), O (uppercase o), I (uppercase i), l (lowercase L)");
             std::process::exit(1);
         }
+    }
+
+    // CUDA range matching doesn't support prefixes starting with '1' (leading zero byte)
+    if args.cuda && args.prefix.starts_with('1') {
+        eprintln!("error: CUDA backend does not support prefixes starting with '1'");
+        eprintln!("       (leading '1' in base58 encodes a zero byte, which requires special handling)");
+        std::process::exit(1);
     }
 
     let output_dir = {
@@ -997,6 +1288,12 @@ mod tests {
 
         // Use a 1-char prefix that matches frequently
         let prefix = "b";
+        let prefix_ranges = compute_prefix_ranges(prefix);
+        let prefix_ranges_flat: Vec<u8> = prefix_ranges
+            .iter()
+            .flat_map(|(lo, hi)| lo.iter().chain(hi.iter()).copied())
+            .collect();
+
         let prefix_c = CString::new(prefix).unwrap();
         let suffix_c = CString::new("").unwrap();
 
@@ -1012,6 +1309,19 @@ mod tests {
             )
         };
         assert!(!handle.is_null());
+
+        // Set ranges for range-based matching
+        let rc = unsafe {
+            cuda_worker_set_ranges(
+                handle,
+                if prefix_ranges_flat.is_empty() { std::ptr::null() } else { prefix_ranges_flat.as_ptr() },
+                prefix_ranges.len() as i32,
+                0, // no suffix
+                std::ptr::null(),
+                0,
+            )
+        };
+        assert_eq!(rc, 0, "cuda_worker_set_ranges failed");
 
         let mut flags = vec![0u8; batch_size];
         let rc = unsafe {
@@ -1872,5 +2182,355 @@ mod tests {
             *dalek_compressed.as_bytes(),
             "CPU ristretto encode doesn't match dalek"
         );
+    }
+
+    // ========================================================================
+    // U512 arithmetic tests
+    // ========================================================================
+
+    #[test]
+    fn test_u512_mul_small() {
+        let mut a = [0u8; 64];
+        a[63] = 58;
+        u512_mul_small(&mut a, 58);
+        // 58 * 58 = 3364 = 0x0D24
+        assert_eq!(a[62], 0x0D);
+        assert_eq!(a[63], 0x24);
+    }
+
+    #[test]
+    fn test_u512_add_small() {
+        let mut a = [0u8; 64];
+        a[63] = 255;
+        u512_add_small(&mut a, 1);
+        assert_eq!(a[63], 0);
+        assert_eq!(a[62], 1);
+    }
+
+    #[test]
+    fn test_u512_add() {
+        let mut a = [0u8; 64];
+        let mut b = [0u8; 64];
+        a[63] = 200;
+        b[63] = 100;
+        let result = u512_add(&a, &b);
+        // 200 + 100 = 300 = 0x012C
+        assert_eq!(result[62], 1);
+        assert_eq!(result[63], 0x2C);
+    }
+
+    #[test]
+    fn test_u512_cmp() {
+        let a = [0u8; 64];
+        let b = [0u8; 64];
+        assert_eq!(u512_cmp(&a, &b), std::cmp::Ordering::Equal);
+
+        let mut c = [0u8; 64];
+        c[0] = 1;
+        assert_eq!(u512_cmp(&c, &a), std::cmp::Ordering::Greater);
+        assert_eq!(u512_cmp(&a, &c), std::cmp::Ordering::Less);
+    }
+
+    // ========================================================================
+    // Range computation tests
+    // ========================================================================
+
+    #[test]
+    fn test_base58_char_values() {
+        // '1' is digit 0
+        assert_eq!(base58_char_values(b'1'), vec![0]);
+        // 'a' -> both 'A' (index 9) and 'a' (index 33)
+        let vals = base58_char_values(b'a');
+        assert!(vals.contains(&9));  // 'A' is at index 9
+        assert!(vals.contains(&33)); // 'a' is at index 33
+        // '2' is digit 1
+        assert_eq!(base58_char_values(b'2'), vec![1]);
+    }
+
+    #[test]
+    fn test_compute_prefix_ranges_basic() {
+        // A single-char prefix should produce some ranges
+        let ranges = compute_prefix_ranges("b");
+        assert!(!ranges.is_empty(), "expected non-empty ranges for prefix 'b'");
+        // Ranges should be sorted and non-overlapping
+        for i in 1..ranges.len() {
+            assert!(u512_cmp(&ranges[i-1].1, &ranges[i].0) != std::cmp::Ordering::Greater,
+                "ranges not sorted/non-overlapping at index {}", i);
+        }
+    }
+
+    #[test]
+    fn test_prefix_ranges_match_bs58() {
+        // Generate random keys and verify that range-based matching agrees with bs58
+        let mut rng = rand::thread_rng();
+        let prefix = "te";
+        let ranges = compute_prefix_ranges(prefix);
+
+        for _ in 0..1000 {
+            let spend_priv = random_scalar(&mut rng);
+            let view_priv = random_scalar(&mut rng);
+            let spend_pub = (&spend_priv * RISTRETTO_BASEPOINT_TABLE).compress();
+            let view_pub = (&view_priv * RISTRETTO_BASEPOINT_TABLE).compress();
+
+            let mut combined = [0u8; 64];
+            combined[..32].copy_from_slice(spend_pub.as_bytes());
+            combined[32..].copy_from_slice(view_pub.as_bytes());
+
+            let address = bs58::encode(&combined).into_string();
+            let bs58_match = address.to_ascii_lowercase().starts_with(prefix);
+
+            // Range-based check
+            let range_match = ranges.iter().any(|(lo, hi)| {
+                u512_cmp(&combined, lo) != std::cmp::Ordering::Less
+                    && u512_cmp(&combined, hi) == std::cmp::Ordering::Less
+            });
+
+            assert_eq!(
+                range_match, bs58_match,
+                "range vs bs58 disagree for addr={} (range={}, bs58={})",
+                address, range_match, bs58_match
+            );
+        }
+    }
+
+    #[test]
+    fn test_compute_suffix_targets_basic() {
+        let (modulus, targets) = compute_suffix_targets("ab");
+        assert_eq!(modulus, 58 * 58);
+        assert!(!targets.is_empty());
+    }
+
+    #[test]
+    fn test_suffix_targets_match_bs58() {
+        let mut rng = rand::thread_rng();
+        let suffix = "z";
+        let (modulus, targets) = compute_suffix_targets(suffix);
+
+        for _ in 0..1000 {
+            let spend_priv = random_scalar(&mut rng);
+            let view_priv = random_scalar(&mut rng);
+            let spend_pub = (&spend_priv * RISTRETTO_BASEPOINT_TABLE).compress();
+            let view_pub = (&view_priv * RISTRETTO_BASEPOINT_TABLE).compress();
+
+            let mut combined = [0u8; 64];
+            combined[..32].copy_from_slice(spend_pub.as_bytes());
+            combined[32..].copy_from_slice(view_pub.as_bytes());
+
+            let address = bs58::encode(&combined).into_string();
+            let bs58_match = address.to_ascii_lowercase().ends_with(suffix);
+
+            // Modular arithmetic check
+            let mut mod_val: u64 = 0;
+            for &byte in combined.iter() {
+                mod_val = (mod_val * 256 + byte as u64) % modulus;
+            }
+            let mod_match = targets.contains(&mod_val);
+
+            assert_eq!(
+                mod_match, bs58_match,
+                "suffix mod vs bs58 disagree for addr={} (mod={}, bs58={})",
+                address, mod_match, bs58_match
+            );
+        }
+    }
+
+    #[cfg(all(feature = "cuda", target_os = "linux"))]
+    #[test]
+    fn test_gpu_range_match_agrees_with_cpu() {
+        // Upload generator table
+        let gen_table = build_gen_table();
+        let rc = unsafe {
+            cuda_init_gen_table(gen_table.as_ptr(), TABLE_BITS as i32)
+        };
+        assert_eq!(rc, 0);
+
+        let start_scalar = Scalar::from(77u64);
+        let start_point: RistrettoPoint = &start_scalar * RISTRETTO_BASEPOINT_TABLE;
+        let coords = extract_point_coords(&start_point);
+
+        let view_priv = Scalar::from(99u64);
+        let view_pub = (&view_priv * RISTRETTO_BASEPOINT_TABLE).compress();
+        let view_pub_bytes = view_pub.to_bytes();
+
+        let prefix = "b";
+        let prefix_ranges = compute_prefix_ranges(prefix);
+        let prefix_ranges_flat: Vec<u8> = prefix_ranges
+            .iter()
+            .flat_map(|(lo, hi)| lo.iter().chain(hi.iter()).copied())
+            .collect();
+
+        let prefix_c = CString::new(prefix).unwrap();
+        let suffix_c = CString::new("").unwrap();
+
+        let batch_size = 4096;
+        let handle = unsafe {
+            cuda_worker_create(
+                batch_size as i32,
+                prefix_c.as_ptr(),
+                prefix.len() as i32,
+                suffix_c.as_ptr(),
+                0,
+                1, // full GPU mode
+            )
+        };
+        assert!(!handle.is_null());
+
+        // Set ranges
+        let rc = unsafe {
+            cuda_worker_set_ranges(
+                handle,
+                if prefix_ranges_flat.is_empty() { std::ptr::null() } else { prefix_ranges_flat.as_ptr() },
+                prefix_ranges.len() as i32,
+                0, // no suffix
+                std::ptr::null(),
+                0,
+            )
+        };
+        assert_eq!(rc, 0, "cuda_worker_set_ranges failed");
+
+        let mut flags = vec![0u8; batch_size];
+        let rc = unsafe {
+            cuda_worker_submit_v2(
+                handle,
+                coords[0..5].as_ptr(),
+                coords[5..10].as_ptr(),
+                coords[10..15].as_ptr(),
+                coords[15..20].as_ptr(),
+                view_pub_bytes.as_ptr(),
+                batch_size as i32,
+                flags.as_mut_ptr(),
+            )
+        };
+        assert_eq!(rc, 0, "cuda_worker_submit_v2 failed");
+
+        // Verify every GPU match/non-match against CPU
+        let mut match_count = 0;
+        for i in 0..batch_size {
+            let priv_i = start_scalar + Scalar::from(i as u64);
+            let pub_i = (&priv_i * RISTRETTO_BASEPOINT_TABLE).compress();
+
+            let mut combined = [0u8; 64];
+            combined[..32].copy_from_slice(pub_i.as_bytes());
+            combined[32..].copy_from_slice(&view_pub_bytes);
+
+            let address = bs58::encode(&combined).into_string();
+            let cpu_match = address.to_ascii_lowercase().starts_with(prefix);
+
+            let gpu_match = flags[i] != 0;
+
+            assert_eq!(
+                gpu_match, cpu_match,
+                "GPU/CPU range match disagree at index {}: gpu={} cpu={} addr={}",
+                i, gpu_match, cpu_match, address
+            );
+
+            if gpu_match {
+                match_count += 1;
+            }
+        }
+
+        assert!(match_count > 0, "no matches found in 4096 candidates with prefix 'b'");
+
+        unsafe { cuda_worker_destroy(handle); }
+    }
+
+    #[cfg(all(feature = "cuda", target_os = "linux"))]
+    #[test]
+    fn test_gpu_suffix_range_match() {
+        // Upload generator table
+        let gen_table = build_gen_table();
+        let rc = unsafe {
+            cuda_init_gen_table(gen_table.as_ptr(), TABLE_BITS as i32)
+        };
+        assert_eq!(rc, 0);
+
+        let start_scalar = Scalar::from(42u64);
+        let start_point: RistrettoPoint = &start_scalar * RISTRETTO_BASEPOINT_TABLE;
+        let coords = extract_point_coords(&start_point);
+
+        let view_priv = Scalar::from(123u64);
+        let view_pub = (&view_priv * RISTRETTO_BASEPOINT_TABLE).compress();
+        let view_pub_bytes = view_pub.to_bytes();
+
+        // Test multiple suffixes to ensure at least one produces matches.
+        // Due to gcd(2^256, 58) = 2, single-char suffixes may be unreachable
+        // for certain view keys (combined mod 58 parity constraint).
+        let suffixes = ["a", "b", "2"];
+        let batch_size = 4096;
+        let mut total_match_count = 0;
+
+        for suffix in &suffixes {
+            let (suffix_modulus, suffix_targets) = compute_suffix_targets(suffix);
+
+            let prefix_c = CString::new("").unwrap();
+            let suffix_c = CString::new(*suffix).unwrap();
+
+            let handle = unsafe {
+                cuda_worker_create(
+                    batch_size as i32,
+                    prefix_c.as_ptr(),
+                    0,
+                    suffix_c.as_ptr(),
+                    suffix.len() as i32,
+                    1,
+                )
+            };
+            assert!(!handle.is_null());
+
+            let rc = unsafe {
+                cuda_worker_set_ranges(
+                    handle,
+                    std::ptr::null(), 0, // no prefix
+                    suffix_modulus,
+                    suffix_targets.as_ptr(),
+                    suffix_targets.len() as i32,
+                )
+            };
+            assert_eq!(rc, 0, "cuda_worker_set_ranges failed");
+
+            let mut flags = vec![0u8; batch_size];
+            let rc = unsafe {
+                cuda_worker_submit_v2(
+                    handle,
+                    coords[0..5].as_ptr(),
+                    coords[5..10].as_ptr(),
+                    coords[10..15].as_ptr(),
+                    coords[15..20].as_ptr(),
+                    view_pub_bytes.as_ptr(),
+                    batch_size as i32,
+                    flags.as_mut_ptr(),
+                )
+            };
+            assert_eq!(rc, 0, "cuda_worker_submit_v2 failed");
+
+            let mut match_count = 0;
+            for i in 0..batch_size {
+                let priv_i = start_scalar + Scalar::from(i as u64);
+                let pub_i = (&priv_i * RISTRETTO_BASEPOINT_TABLE).compress();
+
+                let mut combined = [0u8; 64];
+                combined[..32].copy_from_slice(pub_i.as_bytes());
+                combined[32..].copy_from_slice(&view_pub_bytes);
+
+                let address = bs58::encode(&combined).into_string();
+                let cpu_match = address.to_ascii_lowercase().ends_with(*suffix);
+                let gpu_match = flags[i] != 0;
+
+                assert_eq!(
+                    gpu_match, cpu_match,
+                    "GPU/CPU suffix match disagree for suffix '{}' at index {}: gpu={} cpu={} addr={}",
+                    suffix, i, gpu_match, cpu_match, address
+                );
+
+                if gpu_match { match_count += 1; }
+            }
+
+            total_match_count += match_count;
+            unsafe { cuda_worker_destroy(handle); }
+        }
+
+        // Across all tested suffixes, we should find some matches
+        assert!(total_match_count > 0,
+            "no suffix matches found across all tested suffixes");
     }
 }
