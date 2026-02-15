@@ -658,6 +658,23 @@ __global__ void match_kernel(
 __device__ ge25519_p3 d_gen_table[TABLE_SIZE];
 __device__ fe25519 d_view_pub_fe[1];  // not used directly, but view_pub bytes are
 
+__device__ __forceinline__ int cmp_combined_split_to_bound(
+    const uint8_t* spend_pub,
+    const uint8_t* view_pub,
+    const uint8_t* bound
+) {
+    for (int i = 0; i < 32; i++) {
+        if (spend_pub[i] < bound[i]) return -1;
+        if (spend_pub[i] > bound[i]) return 1;
+    }
+    for (int i = 0; i < 32; i++) {
+        uint8_t b = bound[32 + i];
+        if (view_pub[i] < b) return -1;
+        if (view_pub[i] > b) return 1;
+    }
+    return 0;
+}
+
 __global__ void __launch_bounds__(256, 2) vanity_kernel(
     // Starting point P (in extended Edwards coordinates, as 5 u64 limbs each)
     const u64* start_X, const u64* start_Y, const u64* start_Z, const u64* start_T,
@@ -728,34 +745,28 @@ __global__ void __launch_bounds__(256, 2) vanity_kernel(
         uint8_t spend_pub[32];
         ristretto_encode(spend_pub, &point);
 
-        // Combine: [spend_pub || view_pub] -> 64 bytes
-        uint8_t combined[64];
-        for (int i = 0; i < 32; i++) combined[i] = spend_pub[i];
-        for (int i = 0; i < 32; i++) combined[32 + i] = view_pub[i];
-
-        // PREFIX CHECK: byte comparison against precomputed ranges
-        // Check if combined falls within any [lo, hi) range
+        // PREFIX CHECK: binary search over sorted, non-overlapping [lo, hi) ranges.
         bool prefix_ok = (num_prefix_ranges == 0);  // no prefix = always match
-        for (int r = 0; r < num_prefix_ranges && !prefix_ok; r++) {
-            const uint8_t* lo = prefix_ranges + r * 128;
-            const uint8_t* hi = lo + 64;
-            // Big-endian comparison: check lo <= combined < hi
-            bool ge_lo = true;
-            bool lt_hi = true;
-            bool lo_decided = false;
-            bool hi_decided = false;
-            for (int i = 0; i < 64; i++) {
-                if (!lo_decided) {
-                    if (combined[i] < lo[i]) { ge_lo = false; lo_decided = true; hi_decided = true; break; }
-                    if (combined[i] > lo[i]) { lo_decided = true; }
+        if (!prefix_ok) {
+            int left = 0;
+            int right = num_prefix_ranges;
+            while (left < right) {
+                int mid = left + ((right - left) >> 1);
+                const uint8_t* lo = prefix_ranges + mid * 128;
+                int cmp_lo = cmp_combined_split_to_bound(spend_pub, view_pub, lo);
+                if (cmp_lo < 0) {
+                    right = mid;
+                    continue;
                 }
-                if (!hi_decided) {
-                    if (combined[i] < hi[i]) { lt_hi = true; hi_decided = true; }
-                    else if (combined[i] > hi[i]) { lt_hi = false; hi_decided = true; }
+
+                const uint8_t* hi = lo + 64;
+                int cmp_hi = cmp_combined_split_to_bound(spend_pub, view_pub, hi);
+                if (cmp_hi < 0) {
+                    prefix_ok = true;
+                    break;
                 }
-                if (lo_decided && hi_decided) break;
+                left = mid + 1;
             }
-            prefix_ok = ge_lo && lt_hi;
         }
 
         // SUFFIX CHECK: modular arithmetic (only if prefix matched)
@@ -767,10 +778,22 @@ __global__ void __launch_bounds__(256, 2) vanity_kernel(
             for (int i = 0; i < 32; i++) {
                 spend_mod = (spend_mod * 256 + spend_pub[i]) % suffix_modulus;
             }
-            // For suffix_len <= 5: both values < 2^30, product < 2^60, fits in u64
-            u64 mod_val = (spend_mod * suffix_shift_mod + suffix_view_offset) % suffix_modulus;
-            for (int t = 0; t < num_suffix_targets; t++) {
-                if (mod_val == suffix_targets[t]) { suffix_ok = true; break; }
+            // Keep the multiply in 128-bit to support suffix lengths up to 8 safely.
+            u64 mod_val = (u64)(((u128)spend_mod * suffix_shift_mod + suffix_view_offset) % suffix_modulus);
+
+            int t_left = 0;
+            int t_right = num_suffix_targets;
+            while (t_left < t_right) {
+                int t_mid = t_left + ((t_right - t_left) >> 1);
+                u64 target = suffix_targets[t_mid];
+                if (mod_val < target) {
+                    t_right = t_mid;
+                } else if (mod_val > target) {
+                    t_left = t_mid + 1;
+                } else {
+                    suffix_ok = true;
+                    break;
+                }
             }
         }
 

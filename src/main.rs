@@ -137,7 +137,6 @@ fn base58_char_values(c: u8) -> Vec<u8> {
 /// base58 encoding starts with the given case-insensitive prefix.
 ///
 /// Returns a sorted, merged list of non-overlapping ranges.
-#[cfg(any(feature = "cuda", test))]
 fn compute_prefix_ranges(prefix_lower: &str) -> Vec<([u8; 64], [u8; 64])> {
     if prefix_lower.is_empty() {
         return vec![];
@@ -249,7 +248,6 @@ fn compute_prefix_ranges(prefix_lower: &str) -> Vec<([u8; 64], [u8; 64])> {
 
 /// Compute suffix matching targets: returns (modulus, targets) where
 /// modulus = 58^suffix_len and targets are the valid remainder values.
-#[cfg(any(feature = "cuda", test))]
 fn compute_suffix_targets(suffix_lower: &str) -> (u64, Vec<u64>) {
     if suffix_lower.is_empty() {
         return (0, vec![]);
@@ -261,7 +259,9 @@ fn compute_suffix_targets(suffix_lower: &str) -> (u64, Vec<u64>) {
     // modulus = 58^s
     let mut modulus: u64 = 1;
     for _ in 0..s {
-        modulus = modulus.checked_mul(58).expect("suffix too long for u64 modulus");
+        modulus = modulus
+            .checked_mul(58)
+            .expect("suffix too long for u64 modulus");
     }
 
     // Enumerate case combinations
@@ -323,6 +323,60 @@ fn suffix_view_offset(view_pub_bytes: &[u8; 32], modulus: u64) -> u64 {
     result
 }
 
+#[inline]
+fn cmp_combined_split_to_bound(
+    spend_pub_bytes: &[u8; 32],
+    view_pub_bytes: &[u8; 32],
+    bound: &[u8; 64],
+) -> std::cmp::Ordering {
+    for i in 0..32 {
+        match spend_pub_bytes[i].cmp(&bound[i]) {
+            std::cmp::Ordering::Equal => {}
+            ord => return ord,
+        }
+    }
+    for i in 0..32 {
+        match view_pub_bytes[i].cmp(&bound[32 + i]) {
+            std::cmp::Ordering::Equal => {}
+            ord => return ord,
+        }
+    }
+    std::cmp::Ordering::Equal
+}
+
+#[inline]
+fn prefix_match_ranges_split(
+    spend_pub_bytes: &[u8; 32],
+    view_pub_bytes: &[u8; 32],
+    prefix_ranges: &[([u8; 64], [u8; 64])],
+) -> bool {
+    if prefix_ranges.is_empty() {
+        return true;
+    }
+
+    let mut left = 0usize;
+    let mut right = prefix_ranges.len();
+    while left < right {
+        let mid = left + ((right - left) >> 1);
+        let (lo, hi) = &prefix_ranges[mid];
+        match cmp_combined_split_to_bound(spend_pub_bytes, view_pub_bytes, lo) {
+            std::cmp::Ordering::Less => {
+                right = mid;
+            }
+            _ => {
+                if cmp_combined_split_to_bound(spend_pub_bytes, view_pub_bytes, hi)
+                    == std::cmp::Ordering::Less
+                {
+                    return true;
+                }
+                left = mid + 1;
+            }
+        }
+    }
+
+    false
+}
+
 trait SearchBackend: Send {
     fn name(&self) -> &'static str;
     fn start(
@@ -346,10 +400,28 @@ impl SearchBackend for CpuBackend {
         match_tx: mpsc::Sender<VanityWallet>,
         counter: Arc<AtomicU64>,
     ) -> Result<(), String> {
+        let use_legacy_base58_matcher =
+            !config.prefix_lower.is_empty() && config.prefix_lower.starts_with('1');
+
+        let prefix_ranges = if use_legacy_base58_matcher {
+            Vec::new()
+        } else {
+            compute_prefix_ranges(&config.prefix_lower)
+        };
+        let (suffix_modulus, suffix_targets) = compute_suffix_targets(&config.suffix_lower);
+        let suffix_shift = suffix_shift_mod(suffix_modulus);
+        let prefix_ranges = Arc::new(prefix_ranges);
+        let suffix_targets = Arc::new(suffix_targets);
+        let prefix_bytes = Arc::<[u8]>::from(config.prefix_lower.as_bytes());
+        let suffix_bytes = Arc::<[u8]>::from(config.suffix_lower.as_bytes());
+
         for _ in 0..config.threads {
-            let config = config.clone();
             let match_tx = match_tx.clone();
             let counter = counter.clone();
+            let prefix_ranges = prefix_ranges.clone();
+            let suffix_targets = suffix_targets.clone();
+            let prefix_bytes = prefix_bytes.clone();
+            let suffix_bytes = suffix_bytes.clone();
 
             thread::spawn(move || {
                 let mut rng = rand::thread_rng();
@@ -365,31 +437,63 @@ impl SearchBackend for CpuBackend {
                 let mut local_count: u64 = 0;
                 let mut combined = [0u8; 64];
                 let mut address_bytes = [0u8; 96];
-                let prefix_bytes = config.prefix_lower.as_bytes();
-                let suffix_bytes = config.suffix_lower.as_bytes();
                 combined[32..].copy_from_slice(&view_pub_bytes);
+                let suffix_view_mod = suffix_view_offset(&view_pub_bytes, suffix_modulus);
 
                 loop {
                     let spend_pub = spend_pub_point.compress();
-                    combined[..32].copy_from_slice(spend_pub.as_bytes());
+                    let spend_pub_bytes = spend_pub.as_bytes();
+                    let mut matched_address: Option<String> = None;
 
-                    let encoded_len = bs58::encode(&combined)
-                        .onto(&mut address_bytes[..])
-                        .expect("encoding to byte buffer cannot fail");
+                    if use_legacy_base58_matcher {
+                        combined[..32].copy_from_slice(spend_pub_bytes);
+                        let encoded_len = bs58::encode(&combined)
+                            .onto(&mut address_bytes[..])
+                            .expect("encoding to byte buffer cannot fail");
 
-                    let address_view = &address_bytes[..encoded_len];
-                    let prefix_ok = starts_with_ascii_lowered(address_view, prefix_bytes);
-                    let suffix_ok = ends_with_ascii_lowered(address_view, suffix_bytes);
+                        let address_view = &address_bytes[..encoded_len];
+                        let prefix_ok = starts_with_ascii_lowered(address_view, &prefix_bytes);
+                        let suffix_ok = ends_with_ascii_lowered(address_view, &suffix_bytes);
 
-                    if prefix_ok && suffix_ok {
-                        let address = std::str::from_utf8(address_view)
-                            .expect("base58 output must be valid ASCII")
-                            .to_owned();
+                        if prefix_ok && suffix_ok {
+                            matched_address = Some(
+                                std::str::from_utf8(address_view)
+                                    .expect("base58 output must be valid ASCII")
+                                    .to_owned(),
+                            );
+                        }
+                    } else {
+                        let prefix_ok = prefix_match_ranges_split(
+                            spend_pub_bytes,
+                            &view_pub_bytes,
+                            &prefix_ranges,
+                        );
 
+                        let suffix_ok = if !prefix_ok || suffix_targets.is_empty() {
+                            prefix_ok
+                        } else {
+                            let mut spend_mod: u64 = 0;
+                            for &byte in spend_pub_bytes {
+                                spend_mod = (spend_mod * 256 + byte as u64) % suffix_modulus;
+                            }
+                            let mod_val = ((spend_mod as u128 * suffix_shift as u128
+                                + suffix_view_mod as u128)
+                                % suffix_modulus as u128)
+                                as u64;
+                            suffix_targets.binary_search(&mod_val).is_ok()
+                        };
+
+                        if prefix_ok && suffix_ok {
+                            combined[..32].copy_from_slice(spend_pub_bytes);
+                            matched_address = Some(bs58::encode(&combined).into_string());
+                        }
+                    }
+
+                    if let Some(address) = matched_address {
                         let wallet = VanityWallet {
                             address,
                             spend_private_key: hex::encode(spend_priv.as_bytes()),
-                            spend_public_key: hex::encode(spend_pub.as_bytes()),
+                            spend_public_key: hex::encode(spend_pub_bytes),
                             view_private_key: hex::encode(view_priv.as_bytes()),
                             view_public_key: hex::encode(view_pub_bytes),
                         };
@@ -605,9 +709,7 @@ impl SearchBackend for CudaBackend {
         {
             // Build and upload generator table
             let gen_table = build_gen_table();
-            let rc = unsafe {
-                cuda_init_gen_table(gen_table.as_ptr(), TABLE_BITS as i32)
-            };
+            let rc = unsafe { cuda_init_gen_table(gen_table.as_ptr(), TABLE_BITS as i32) };
             if rc != 0 {
                 return Err(format!("cuda_init_gen_table failed with code {}", rc));
             }
@@ -660,7 +762,8 @@ impl SearchBackend for CudaBackend {
 
                     // Random starting scalar
                     let mut spend_priv = random_scalar(&mut rng);
-                    let mut spend_pub_point: RistrettoPoint = &spend_priv * RISTRETTO_BASEPOINT_TABLE;
+                    let mut spend_pub_point: RistrettoPoint =
+                        &spend_priv * RISTRETTO_BASEPOINT_TABLE;
 
                     // Precompute the batch stride: batch_size * G
                     let batch_stride_scalar = Scalar::from(batch_size as u64);
@@ -691,10 +794,18 @@ impl SearchBackend for CudaBackend {
                     let rc = unsafe {
                         cuda_worker_set_ranges(
                             handle,
-                            if prefix_ranges_flat.is_empty() { std::ptr::null() } else { prefix_ranges_flat.as_ptr() },
+                            if prefix_ranges_flat.is_empty() {
+                                std::ptr::null()
+                            } else {
+                                prefix_ranges_flat.as_ptr()
+                            },
                             num_prefix_ranges,
                             suffix_modulus,
-                            if suffix_targets.is_empty() { std::ptr::null() } else { suffix_targets.as_ptr() },
+                            if suffix_targets.is_empty() {
+                                std::ptr::null()
+                            } else {
+                                suffix_targets.as_ptr()
+                            },
                             suffix_targets.len() as i32,
                             shift_mod,
                             view_offset,
@@ -932,7 +1043,9 @@ fn main() {
     // CUDA range matching doesn't support prefixes starting with '1' (leading zero byte)
     if args.cuda && args.prefix.starts_with('1') {
         eprintln!("error: CUDA backend does not support prefixes starting with '1'");
-        eprintln!("       (leading '1' in base58 encodes a zero byte, which requires special handling)");
+        eprintln!(
+            "       (leading '1' in base58 encodes a zero byte, which requires special handling)"
+        );
         std::process::exit(1);
     }
 
@@ -965,9 +1078,14 @@ fn main() {
     });
 
     let num_threads = args.threads.unwrap_or_else(|| {
-        thread::available_parallelism()
-            .map(|n| n.get())
-            .unwrap_or(4)
+        if args.cuda {
+            // Two submit threads tend to outperform four on desktop GPUs that also drive displays.
+            2
+        } else {
+            thread::available_parallelism()
+                .map(|n| n.get())
+                .unwrap_or(4)
+        }
     });
 
     let batch_size = if args.cuda {
@@ -1036,7 +1154,11 @@ fn main() {
         let elapsed = start.elapsed();
         let secs = elapsed.as_secs_f64();
         let rate = if secs > 0.0 { count as f64 / secs } else { 0.0 };
-        let estimate = if rate > 0.0 { (expected / rate) as u64 } else { 0 };
+        let estimate = if rate > 0.0 {
+            (expected / rate) as u64
+        } else {
+            0
+        };
         let found_n = found.load(Ordering::Relaxed);
 
         let mut handle = stderr.lock();
@@ -1074,7 +1196,7 @@ mod tests {
         assert!(validate_pattern("0").is_err()); // zero not in base58
         assert!(validate_pattern("!").is_err()); // symbol not in base58
         assert!(validate_pattern(" ").is_err()); // space not in base58
-        // O, I, l are valid for case-insensitive search (match o, i, L)
+                                                 // O, I, l are valid for case-insensitive search (match o, i, L)
         assert!(validate_pattern("O").is_ok());
         assert!(validate_pattern("I").is_ok());
         assert!(validate_pattern("l").is_ok());
@@ -1115,8 +1237,11 @@ mod tests {
         let address = bs58::encode(&combined).into_string();
 
         // Address should be valid base58 and reasonable length (~87 chars for 64 bytes)
-        assert!(address.len() >= 80 && address.len() <= 90,
-            "address length {} outside expected range", address.len());
+        assert!(
+            address.len() >= 80 && address.len() <= 90,
+            "address length {} outside expected range",
+            address.len()
+        );
 
         // Round-trip: decode and re-encode should match
         let decoded = bs58::decode(&address).into_vec().unwrap();
@@ -1181,8 +1306,14 @@ mod tests {
         let regen_spend_pub = (&spend_priv * RISTRETTO_BASEPOINT_TABLE).compress();
         let regen_view_pub = (&view_priv * RISTRETTO_BASEPOINT_TABLE).compress();
 
-        assert_eq!(hex::encode(regen_spend_pub.as_bytes()), wallet.spend_public_key);
-        assert_eq!(hex::encode(regen_view_pub.as_bytes()), wallet.view_public_key);
+        assert_eq!(
+            hex::encode(regen_spend_pub.as_bytes()),
+            wallet.spend_public_key
+        );
+        assert_eq!(
+            hex::encode(regen_view_pub.as_bytes()),
+            wallet.view_public_key
+        );
 
         // If canonical, also verify round-trip
         if let Some(s) = recovered_spend_priv.into() {
@@ -1244,9 +1375,7 @@ mod tests {
     fn test_gpu_ristretto_matches_cpu() {
         // Upload generator table
         let gen_table = build_gen_table();
-        let rc = unsafe {
-            cuda_init_gen_table(gen_table.as_ptr(), TABLE_BITS as i32)
-        };
+        let rc = unsafe { cuda_init_gen_table(gen_table.as_ptr(), TABLE_BITS as i32) };
         assert_eq!(rc, 0, "cuda_init_gen_table failed");
 
         // Verify 256 keys match CPU
@@ -1258,9 +1387,7 @@ mod tests {
     fn test_gpu_different_starting_points() {
         // Upload generator table
         let gen_table = build_gen_table();
-        let rc = unsafe {
-            cuda_init_gen_table(gen_table.as_ptr(), TABLE_BITS as i32)
-        };
+        let rc = unsafe { cuda_init_gen_table(gen_table.as_ptr(), TABLE_BITS as i32) };
         assert_eq!(rc, 0);
 
         // Test with several different starting scalars
@@ -1305,9 +1432,7 @@ mod tests {
     fn test_gpu_vanity_match_agrees_with_cpu() {
         // Upload generator table
         let gen_table = build_gen_table();
-        let rc = unsafe {
-            cuda_init_gen_table(gen_table.as_ptr(), TABLE_BITS as i32)
-        };
+        let rc = unsafe { cuda_init_gen_table(gen_table.as_ptr(), TABLE_BITS as i32) };
         assert_eq!(rc, 0);
 
         let start_scalar = Scalar::from(77u64);
@@ -1346,12 +1471,17 @@ mod tests {
         let rc = unsafe {
             cuda_worker_set_ranges(
                 handle,
-                if prefix_ranges_flat.is_empty() { std::ptr::null() } else { prefix_ranges_flat.as_ptr() },
+                if prefix_ranges_flat.is_empty() {
+                    std::ptr::null()
+                } else {
+                    prefix_ranges_flat.as_ptr()
+                },
                 prefix_ranges.len() as i32,
                 0, // no suffix
                 std::ptr::null(),
                 0,
-                0, 0,
+                0,
+                0,
             )
         };
         assert_eq!(rc, 0, "cuda_worker_set_ranges failed");
@@ -1369,9 +1499,8 @@ mod tests {
         };
         assert_eq!(rc, 0, "cuda_worker_submit_v2 failed");
 
-        let flags = unsafe {
-            std::slice::from_raw_parts(cuda_worker_get_flags(handle), batch_size)
-        };
+        let flags =
+            unsafe { std::slice::from_raw_parts(cuda_worker_get_flags(handle), batch_size) };
 
         // Verify every GPU match/non-match against CPU
         let mut match_count = 0;
@@ -1400,9 +1529,14 @@ mod tests {
         }
 
         // With prefix "b" and 4096 candidates, we should find some matches
-        assert!(match_count > 0, "no matches found in 4096 candidates with prefix 'b'");
+        assert!(
+            match_count > 0,
+            "no matches found in 4096 candidates with prefix 'b'"
+        );
 
-        unsafe { cuda_worker_destroy(handle); }
+        unsafe {
+            cuda_worker_destroy(handle);
+        }
     }
 
     #[cfg(all(feature = "cuda", target_os = "linux"))]
@@ -1426,14 +1560,28 @@ mod tests {
         assert_eq!(rc, 0, "cuda_diag_compress failed");
 
         let labels = [
-            "u1", "u2", "inv", "den1", "den2", "z_inv",
-            "ix0", "iy0", "ench_den", "t_zinv",
-            "x(rot)", "y(rot)", "den_inv(rot)",
-            "x_zinv", "y_before_neg", "Z-y", "s_before_abs", "s_final",
+            "u1",
+            "u2",
+            "inv",
+            "den1",
+            "den2",
+            "z_inv",
+            "ix0",
+            "iy0",
+            "ench_den",
+            "t_zinv",
+            "x(rot)",
+            "y(rot)",
+            "den_inv(rot)",
+            "x_zinv",
+            "y_before_neg",
+            "Z-y",
+            "s_before_abs",
+            "s_final",
             "compressed",
         ];
         for (i, label) in labels.iter().enumerate() {
-            let bytes = &diag[i*32..(i+1)*32];
+            let bytes = &diag[i * 32..(i + 1) * 32];
             eprintln!("GPU {:>15}: {}", label, hex::encode(bytes));
         }
         let rotate = diag[608];
@@ -1448,7 +1596,13 @@ mod tests {
         let t_limbs = &coords[15..20];
 
         fn fe_add_limbs(f: &[u64], g: &[u64]) -> [u64; 5] {
-            [f[0]+g[0], f[1]+g[1], f[2]+g[2], f[3]+g[3], f[4]+g[4]]
+            [
+                f[0] + g[0],
+                f[1] + g[1],
+                f[2] + g[2],
+                f[3] + g[3],
+                f[4] + g[4],
+            ]
         }
         fn fe_sub_limbs(f: &[u64], g: &[u64]) -> [u64; 5] {
             let mask: u64 = (1u64 << 51) - 1;
@@ -1461,22 +1615,53 @@ mod tests {
             ]
         }
         fn fe_mul_limbs(f: &[u64], g: &[u64]) -> [u64; 5] {
-            let (f0,f1,f2,f3,f4) = (f[0],f[1],f[2],f[3],f[4]);
-            let (g0,g1,g2,g3,g4) = (g[0],g[1],g[2],g[3],g[4]);
-            let (g1_19, g2_19, g3_19, g4_19) = (g1*19, g2*19, g3*19, g4*19);
-            let h0: u128 = f0 as u128*g0 as u128 + f1 as u128*g4_19 as u128 + f2 as u128*g3_19 as u128 + f3 as u128*g2_19 as u128 + f4 as u128*g1_19 as u128;
-            let h1: u128 = f0 as u128*g1 as u128 + f1 as u128*g0 as u128 + f2 as u128*g4_19 as u128 + f3 as u128*g3_19 as u128 + f4 as u128*g2_19 as u128;
-            let h2: u128 = f0 as u128*g2 as u128 + f1 as u128*g1 as u128 + f2 as u128*g0 as u128 + f3 as u128*g4_19 as u128 + f4 as u128*g3_19 as u128;
-            let h3: u128 = f0 as u128*g3 as u128 + f1 as u128*g2 as u128 + f2 as u128*g1 as u128 + f3 as u128*g0 as u128 + f4 as u128*g4_19 as u128;
-            let h4: u128 = f0 as u128*g4 as u128 + f1 as u128*g3 as u128 + f2 as u128*g2 as u128 + f3 as u128*g1 as u128 + f4 as u128*g0 as u128;
+            let (f0, f1, f2, f3, f4) = (f[0], f[1], f[2], f[3], f[4]);
+            let (g0, g1, g2, g3, g4) = (g[0], g[1], g[2], g[3], g[4]);
+            let (g1_19, g2_19, g3_19, g4_19) = (g1 * 19, g2 * 19, g3 * 19, g4 * 19);
+            let h0: u128 = f0 as u128 * g0 as u128
+                + f1 as u128 * g4_19 as u128
+                + f2 as u128 * g3_19 as u128
+                + f3 as u128 * g2_19 as u128
+                + f4 as u128 * g1_19 as u128;
+            let h1: u128 = f0 as u128 * g1 as u128
+                + f1 as u128 * g0 as u128
+                + f2 as u128 * g4_19 as u128
+                + f3 as u128 * g3_19 as u128
+                + f4 as u128 * g2_19 as u128;
+            let h2: u128 = f0 as u128 * g2 as u128
+                + f1 as u128 * g1 as u128
+                + f2 as u128 * g0 as u128
+                + f3 as u128 * g4_19 as u128
+                + f4 as u128 * g3_19 as u128;
+            let h3: u128 = f0 as u128 * g3 as u128
+                + f1 as u128 * g2 as u128
+                + f2 as u128 * g1 as u128
+                + f3 as u128 * g0 as u128
+                + f4 as u128 * g4_19 as u128;
+            let h4: u128 = f0 as u128 * g4 as u128
+                + f1 as u128 * g3 as u128
+                + f2 as u128 * g2 as u128
+                + f3 as u128 * g1 as u128
+                + f4 as u128 * g0 as u128;
             let mask: u64 = (1u64 << 51) - 1;
-            let c = (h0 >> 51) as u64; let v0 = h0 as u64 & mask; let h1 = h1 + c as u128;
-            let c = (h1 >> 51) as u64; let v1 = h1 as u64 & mask; let h2 = h2 + c as u128;
-            let c = (h2 >> 51) as u64; let v2 = h2 as u64 & mask; let h3 = h3 + c as u128;
-            let c = (h3 >> 51) as u64; let v3 = h3 as u64 & mask; let h4 = h4 + c as u128;
-            let c = (h4 >> 51) as u64; let v4 = h4 as u64 & mask;
-            let mut r = [v0 + c*19, v1, v2, v3, v4];
-            let c = r[0] >> 51; r[0] &= mask; r[1] += c;
+            let c = (h0 >> 51) as u64;
+            let v0 = h0 as u64 & mask;
+            let h1 = h1 + c as u128;
+            let c = (h1 >> 51) as u64;
+            let v1 = h1 as u64 & mask;
+            let h2 = h2 + c as u128;
+            let c = (h2 >> 51) as u64;
+            let v2 = h2 as u64 & mask;
+            let h3 = h3 + c as u128;
+            let c = (h3 >> 51) as u64;
+            let v3 = h3 as u64 & mask;
+            let h4 = h4 + c as u128;
+            let c = (h4 >> 51) as u64;
+            let v4 = h4 as u64 & mask;
+            let mut r = [v0 + c * 19, v1, v2, v3, v4];
+            let c = r[0] >> 51;
+            r[0] &= mask;
+            r[1] += c;
             r
         }
         fn limbs_to_bytes_v2(v: &[u64; 5]) -> [u8; 32] {
@@ -1484,22 +1669,42 @@ mod tests {
             let mut h = *v;
             let mask: u64 = (1u64 << 51) - 1;
             let mut c: u64;
-            c = h[0] >> 51; h[0] &= mask; h[1] += c;
-            c = h[1] >> 51; h[1] &= mask; h[2] += c;
-            c = h[2] >> 51; h[2] &= mask; h[3] += c;
-            c = h[3] >> 51; h[3] &= mask; h[4] += c;
-            c = h[4] >> 51; h[4] &= mask; h[0] += c * 19;
-            c = h[0] >> 51; h[0] &= mask; h[1] += c;
+            c = h[0] >> 51;
+            h[0] &= mask;
+            h[1] += c;
+            c = h[1] >> 51;
+            h[1] &= mask;
+            h[2] += c;
+            c = h[2] >> 51;
+            h[2] &= mask;
+            h[3] += c;
+            c = h[3] >> 51;
+            h[3] &= mask;
+            h[4] += c;
+            c = h[4] >> 51;
+            h[4] &= mask;
+            h[0] += c * 19;
+            c = h[0] >> 51;
+            h[0] &= mask;
+            h[1] += c;
             let mut q = (h[0] + 19) >> 51;
             q = (h[1] + q) >> 51;
             q = (h[2] + q) >> 51;
             q = (h[3] + q) >> 51;
             q = (h[4] + q) >> 51;
             h[0] += q * 19;
-            c = h[0] >> 51; h[0] &= mask; h[1] += c;
-            c = h[1] >> 51; h[1] &= mask; h[2] += c;
-            c = h[2] >> 51; h[2] &= mask; h[3] += c;
-            c = h[3] >> 51; h[3] &= mask; h[4] += c;
+            c = h[0] >> 51;
+            h[0] &= mask;
+            h[1] += c;
+            c = h[1] >> 51;
+            h[1] &= mask;
+            h[2] += c;
+            c = h[2] >> 51;
+            h[2] &= mask;
+            h[3] += c;
+            c = h[3] >> 51;
+            h[3] &= mask;
+            h[4] += c;
             h[4] &= mask;
             let lo0 = h[0] | (h[1] << 51);
             let lo1 = (h[1] >> 13) | (h[2] << 38);
@@ -1524,24 +1729,44 @@ mod tests {
         eprintln!("CPU             u2: {}", hex::encode(cpu_u2_bytes));
 
         fn fe_sq_limbs(f: &[u64]) -> [u64; 5] {
-            let (f0,f1,f2,f3,f4) = (f[0],f[1],f[2],f[3],f[4]);
+            let (f0, f1, f2, f3, f4) = (f[0], f[1], f[2], f[3], f[4]);
             let f0_2 = f0 * 2;
             let f1_2 = f1 * 2;
 
-            let h0: u128 = f0 as u128*f0 as u128 + (f1*38) as u128*f4 as u128 + (f2*38) as u128*f3 as u128;
-            let h1: u128 = f0_2 as u128*f1 as u128 + (f2*38) as u128*f4 as u128 + (f3*19) as u128*f3 as u128;
-            let h2: u128 = f0_2 as u128*f2 as u128 + f1 as u128*f1 as u128 + (f3*38) as u128*f4 as u128;
-            let h3: u128 = f0_2 as u128*f3 as u128 + f1_2 as u128*f2 as u128 + (f4*19) as u128*f4 as u128;
-            let h4: u128 = f0_2 as u128*f4 as u128 + f1_2 as u128*f3 as u128 + f2 as u128*f2 as u128;
+            let h0: u128 = f0 as u128 * f0 as u128
+                + (f1 * 38) as u128 * f4 as u128
+                + (f2 * 38) as u128 * f3 as u128;
+            let h1: u128 = f0_2 as u128 * f1 as u128
+                + (f2 * 38) as u128 * f4 as u128
+                + (f3 * 19) as u128 * f3 as u128;
+            let h2: u128 = f0_2 as u128 * f2 as u128
+                + f1 as u128 * f1 as u128
+                + (f3 * 38) as u128 * f4 as u128;
+            let h3: u128 = f0_2 as u128 * f3 as u128
+                + f1_2 as u128 * f2 as u128
+                + (f4 * 19) as u128 * f4 as u128;
+            let h4: u128 =
+                f0_2 as u128 * f4 as u128 + f1_2 as u128 * f3 as u128 + f2 as u128 * f2 as u128;
 
             let mask: u64 = (1u64 << 51) - 1;
-            let c = (h0 >> 51) as u64; let v0 = h0 as u64 & mask; let h1 = h1 + c as u128;
-            let c = (h1 >> 51) as u64; let v1 = h1 as u64 & mask; let h2 = h2 + c as u128;
-            let c = (h2 >> 51) as u64; let v2 = h2 as u64 & mask; let h3 = h3 + c as u128;
-            let c = (h3 >> 51) as u64; let v3 = h3 as u64 & mask; let h4 = h4 + c as u128;
-            let c = (h4 >> 51) as u64; let v4 = h4 as u64 & mask;
-            let mut r = [v0 + c*19, v1, v2, v3, v4];
-            let c = r[0] >> 51; r[0] &= mask; r[1] += c;
+            let c = (h0 >> 51) as u64;
+            let v0 = h0 as u64 & mask;
+            let h1 = h1 + c as u128;
+            let c = (h1 >> 51) as u64;
+            let v1 = h1 as u64 & mask;
+            let h2 = h2 + c as u128;
+            let c = (h2 >> 51) as u64;
+            let v2 = h2 as u64 & mask;
+            let h3 = h3 + c as u128;
+            let c = (h3 >> 51) as u64;
+            let v3 = h3 as u64 & mask;
+            let h4 = h4 + c as u128;
+            let c = (h4 >> 51) as u64;
+            let v4 = h4 as u64 & mask;
+            let mut r = [v0 + c * 19, v1, v2, v3, v4];
+            let c = r[0] >> 51;
+            r[0] &= mask;
+            r[1] += c;
             r
         }
 
@@ -1573,19 +1798,21 @@ mod tests {
         // uv7 = 1 * v7 = v7
         // pow22523(uv7)
         // This is too complex to inline. Let me just check if inv matches.
-        let gpu_inv = &diag[2*32..3*32];
+        let gpu_inv = &diag[2 * 32..3 * 32];
         eprintln!("GPU          inv: {}", hex::encode(gpu_inv));
 
         // Check first divergence
         let gpu_u1 = &diag[0..32];
-        let gpu_u2 = &diag[1*32..2*32];
+        let gpu_u2 = &diag[1 * 32..2 * 32];
         assert_eq!(gpu_u1, &cpu_u1_bytes, "u1 mismatch");
         assert_eq!(gpu_u2, &cpu_u2_bytes, "u2 mismatch");
 
         // Implement full sqrt_ratio_m1 on CPU to find where GPU diverges
         fn fe_sq_n_limbs(f: &[u64; 5], n: usize) -> [u64; 5] {
             let mut h = fe_sq_limbs(f);
-            for _ in 1..n { h = fe_sq_limbs(&h); }
+            for _ in 1..n {
+                h = fe_sq_limbs(&h);
+            }
             h
         }
         fn fe_neg_limbs(f: &[u64; 5]) -> [u64; 5] {
@@ -1593,28 +1820,28 @@ mod tests {
             fe_sub_limbs(&zero, f)
         }
         fn fe_pow22523_limbs(f: &[u64; 5]) -> [u64; 5] {
-            let mut t0 = fe_sq_limbs(f);        // f^2
+            let mut t0 = fe_sq_limbs(f); // f^2
             let mut t1 = fe_sq_n_limbs(&t0, 2); // f^8
-            t1 = fe_mul_limbs(f, &t1);           // f^9
-            t0 = fe_mul_limbs(&t0, &t1);          // f^11
-            t0 = fe_sq_limbs(&t0);                 // f^22
-            t0 = fe_mul_limbs(&t1, &t0);           // f^31
-            t1 = fe_sq_n_limbs(&t0, 5);           // f^(2^10-32)
-            t0 = fe_mul_limbs(&t1, &t0);           // f^(2^10-1)
-            t1 = fe_sq_n_limbs(&t0, 10);          // f^(2^20-2^10)
-            t1 = fe_mul_limbs(&t1, &t0);           // f^(2^20-1)
-            let mut t2 = fe_sq_n_limbs(&t1, 20);  // f^(2^40-2^20)
-            t1 = fe_mul_limbs(&t2, &t1);           // f^(2^40-1)
-            t1 = fe_sq_n_limbs(&t1, 10);          // f^(2^50-2^10)
-            t0 = fe_mul_limbs(&t1, &t0);           // f^(2^50-1)
-            t1 = fe_sq_n_limbs(&t0, 50);          // f^(2^100-2^50)
-            t1 = fe_mul_limbs(&t1, &t0);           // f^(2^100-1)
-            t2 = fe_sq_n_limbs(&t1, 100);         // f^(2^200-2^100)
-            t1 = fe_mul_limbs(&t2, &t1);           // f^(2^200-1)
-            t1 = fe_sq_n_limbs(&t1, 50);          // f^(2^250-2^50)
-            t0 = fe_mul_limbs(&t1, &t0);           // f^(2^250-1)
-            t0 = fe_sq_n_limbs(&t0, 2);           // f^(2^252-4)
-            fe_mul_limbs(&t0, f)                    // f^(2^252-3)
+            t1 = fe_mul_limbs(f, &t1); // f^9
+            t0 = fe_mul_limbs(&t0, &t1); // f^11
+            t0 = fe_sq_limbs(&t0); // f^22
+            t0 = fe_mul_limbs(&t1, &t0); // f^31
+            t1 = fe_sq_n_limbs(&t0, 5); // f^(2^10-32)
+            t0 = fe_mul_limbs(&t1, &t0); // f^(2^10-1)
+            t1 = fe_sq_n_limbs(&t0, 10); // f^(2^20-2^10)
+            t1 = fe_mul_limbs(&t1, &t0); // f^(2^20-1)
+            let mut t2 = fe_sq_n_limbs(&t1, 20); // f^(2^40-2^20)
+            t1 = fe_mul_limbs(&t2, &t1); // f^(2^40-1)
+            t1 = fe_sq_n_limbs(&t1, 10); // f^(2^50-2^10)
+            t0 = fe_mul_limbs(&t1, &t0); // f^(2^50-1)
+            t1 = fe_sq_n_limbs(&t0, 50); // f^(2^100-2^50)
+            t1 = fe_mul_limbs(&t1, &t0); // f^(2^100-1)
+            t2 = fe_sq_n_limbs(&t1, 100); // f^(2^200-2^100)
+            t1 = fe_mul_limbs(&t2, &t1); // f^(2^200-1)
+            t1 = fe_sq_n_limbs(&t1, 50); // f^(2^250-2^50)
+            t0 = fe_mul_limbs(&t1, &t0); // f^(2^250-1)
+            t0 = fe_sq_n_limbs(&t0, 2); // f^(2^252-4)
+            fe_mul_limbs(&t0, f) // f^(2^252-3)
         }
         fn fe_tobytes_limbs(v: &[u64; 5]) -> [u8; 32] {
             limbs_to_bytes_v2(v)
@@ -1626,13 +1853,25 @@ mod tests {
             fe_tobytes_limbs(f)[0] & 1 == 1
         }
         fn fe_cmov_limbs(f: &mut [u64; 5], g: &[u64; 5], b: bool) {
-            if b { *f = *g; }
+            if b {
+                *f = *g;
+            }
         }
         fn fe_abs_limbs(f: &[u64; 5]) -> [u64; 5] {
-            if fe_isneg_limbs(f) { fe_neg_limbs(f) } else { *f }
+            if fe_isneg_limbs(f) {
+                fe_neg_limbs(f)
+            } else {
+                *f
+            }
         }
 
-        let sqrt_m1: [u64; 5] = [1718705420411056, 234908883556509, 2233514472574048, 2117202627021982, 765476049583133];
+        let sqrt_m1: [u64; 5] = [
+            1718705420411056,
+            234908883556509,
+            2233514472574048,
+            2117202627021982,
+            765476049583133,
+        ];
 
         fn sqrt_ratio_m1_cpu(u: &[u64; 5], v: &[u64; 5], sqrt_m1: &[u64; 5]) -> ([u64; 5], bool) {
             let v_sq = fe_sq_limbs(v);
@@ -1665,8 +1904,8 @@ mod tests {
         let (cpu_inv, _) = sqrt_ratio_m1_cpu(&one_limbs, &cpu_u1_u2sq, &sqrt_m1);
         let cpu_inv_bytes = limbs_to_bytes_v2(&cpu_inv);
         eprintln!("CPU          inv: {}", hex::encode(cpu_inv_bytes));
-        eprintln!("GPU          inv: {}", hex::encode(&diag[2*32..3*32]));
-        if cpu_inv_bytes == diag[2*32..3*32] {
+        eprintln!("GPU          inv: {}", hex::encode(&diag[2 * 32..3 * 32]));
+        if cpu_inv_bytes == diag[2 * 32..3 * 32] {
             eprintln!("*** inv MATCHES - bug is after sqrt_ratio_m1 ***");
         } else {
             eprintln!("*** inv MISMATCH - bug is in sqrt_ratio_m1/pow22523 ***");
@@ -1674,14 +1913,18 @@ mod tests {
 
         // Verify Edwards invariant: T*Z == X*Y (if fields in expected order)
         let xy_limbs = fe_mul_limbs(x_limbs, y_limbs);
-        let tz_limbs = fe_mul_limbs(&coords[15..20].try_into().unwrap_or([0;5]),
-                                     &coords[10..15].try_into().unwrap_or([0;5]));
+        let tz_limbs = fe_mul_limbs(
+            &coords[15..20].try_into().unwrap_or([0; 5]),
+            &coords[10..15].try_into().unwrap_or([0; 5]),
+        );
         let xy_bytes = limbs_to_bytes_v2(&xy_limbs);
         let tz_bytes = limbs_to_bytes_v2(&tz_limbs);
         eprintln!("X*Y: {}", hex::encode(xy_bytes));
         eprintln!("T*Z: {}", hex::encode(tz_bytes));
         if xy_bytes != tz_bytes {
-            eprintln!("*** FIELDS REORDERED! T*Z != X*Y - extract_point_coords has wrong field order ***");
+            eprintln!(
+                "*** FIELDS REORDERED! T*Z != X*Y - extract_point_coords has wrong field order ***"
+            );
 
             // Try all 24 permutations of the 4 field elements
             let fields = [
@@ -1692,15 +1935,21 @@ mod tests {
             ];
             for ix in 0..4 {
                 for iy in 0..4 {
-                    if iy == ix { continue; }
+                    if iy == ix {
+                        continue;
+                    }
                     for iz in 0..4 {
-                        if iz == ix || iz == iy { continue; }
+                        if iz == ix || iz == iy {
+                            continue;
+                        }
                         let it = 6 - ix - iy - iz; // remaining index
                         let xy = fe_mul_limbs(fields[ix].0, fields[iy].0);
                         let tz = fe_mul_limbs(fields[it].0, fields[iz].0);
                         if limbs_to_bytes_v2(&xy) == limbs_to_bytes_v2(&tz) {
-                            eprintln!("Found correct ordering: X={} Y={} Z={} T={}",
-                                fields[ix].1, fields[iy].1, fields[iz].1, fields[it].1);
+                            eprintln!(
+                                "Found correct ordering: X={} Y={} Z={} T={}",
+                                fields[ix].1, fields[iy].1, fields[iz].1, fields[it].1
+                            );
                         }
                     }
                 }
@@ -1720,7 +1969,13 @@ mod tests {
         let y_arr: [u64; 5] = [coords[5], coords[6], coords[7], coords[8], coords[9]];
         let cpu_ix0 = fe_mul_limbs(&x_arr, &sqrt_m1);
         let cpu_iy0 = fe_mul_limbs(&y_arr, &sqrt_m1);
-        let invsqrt_a_minus_d: [u64; 5] = [278908739862762, 821645201101625, 8113234426968, 1777959178193151, 2118520810568447];
+        let invsqrt_a_minus_d: [u64; 5] = [
+            278908739862762,
+            821645201101625,
+            8113234426968,
+            1777959178193151,
+            2118520810568447,
+        ];
         let cpu_ench_den = fe_mul_limbs(&cpu_den1, &invsqrt_a_minus_d);
 
         let cpu_t_zinv = fe_mul_limbs(&t_limbs_arr, &cpu_z_inv);
@@ -1748,26 +2003,47 @@ mod tests {
 
         // Print all CPU intermediates and compare
         let vals = [
-            ("den1", &cpu_den1), ("den2", &cpu_den2), ("z_inv", &cpu_z_inv),
-            ("ix0", &cpu_ix0), ("iy0", &cpu_iy0), ("ench_den", &cpu_ench_den),
-            ("t_zinv", &cpu_t_zinv), ("x(rot)", &cpu_x), ("y(rot)", &cpu_y),
-            ("den_inv(rot)", &cpu_den_inv), ("x_zinv", &cpu_x_zinv),
+            ("den1", &cpu_den1),
+            ("den2", &cpu_den2),
+            ("z_inv", &cpu_z_inv),
+            ("ix0", &cpu_ix0),
+            ("iy0", &cpu_iy0),
+            ("ench_den", &cpu_ench_den),
+            ("t_zinv", &cpu_t_zinv),
+            ("x(rot)", &cpu_x),
+            ("y(rot)", &cpu_y),
+            ("den_inv(rot)", &cpu_den_inv),
+            ("x_zinv", &cpu_x_zinv),
             ("s_final", &cpu_s_final),
         ];
         let gpu_labels_and_offsets = [
-            ("den1", 3), ("den2", 4), ("z_inv", 5),
-            ("ix0", 6), ("iy0", 7), ("ench_den", 8),
-            ("t_zinv", 9), ("x(rot)", 10), ("y(rot)", 11),
-            ("den_inv(rot)", 12), ("x_zinv", 13),
+            ("den1", 3),
+            ("den2", 4),
+            ("z_inv", 5),
+            ("ix0", 6),
+            ("iy0", 7),
+            ("ench_den", 8),
+            ("t_zinv", 9),
+            ("x(rot)", 10),
+            ("y(rot)", 11),
+            ("den_inv(rot)", 12),
+            ("x_zinv", 13),
             ("s_final", 17),
         ];
         eprintln!("CPU rotate={} neg_y={}", cpu_rotate, cpu_neg_y);
         let mut first_mismatch = None;
-        for (i, ((name, cpu_val), (_, gpu_offset))) in vals.iter().zip(gpu_labels_and_offsets.iter()).enumerate() {
+        for (i, ((name, cpu_val), (_, gpu_offset))) in
+            vals.iter().zip(gpu_labels_and_offsets.iter()).enumerate()
+        {
             let cpu_bytes = limbs_to_bytes_v2(cpu_val);
-            let gpu_bytes = &diag[gpu_offset*32..(gpu_offset+1)*32];
+            let gpu_bytes = &diag[gpu_offset * 32..(gpu_offset + 1) * 32];
             let matched = cpu_bytes == gpu_bytes;
-            eprintln!("CPU {:>15}: {} {}", name, hex::encode(&cpu_bytes), if matched { "✓" } else { "MISMATCH" });
+            eprintln!(
+                "CPU {:>15}: {} {}",
+                name,
+                hex::encode(&cpu_bytes),
+                if matched { "✓" } else { "MISMATCH" }
+            );
             if !matched && first_mismatch.is_none() {
                 first_mismatch = Some(i);
             }
@@ -1793,9 +2069,12 @@ mod tests {
         }
 
         // Compare compressed output
-        let gpu_compressed = &diag[18*32..19*32];
+        let gpu_compressed = &diag[18 * 32..19 * 32];
         let cpu_compressed = point.compress();
-        eprintln!("CPU    compressed: {}", hex::encode(cpu_compressed.as_bytes()));
+        eprintln!(
+            "CPU    compressed: {}",
+            hex::encode(cpu_compressed.as_bytes())
+        );
 
         // Try to decompress GPU result
         use curve25519_dalek::ristretto::CompressedRistretto;
@@ -1804,12 +2083,17 @@ mod tests {
             Some(gpu_point) => {
                 eprintln!("GPU compressed IS a valid ristretto point");
                 if gpu_point == point {
-                    eprintln!("GPU point == original point (same group element, different encoding?!)");
+                    eprintln!(
+                        "GPU point == original point (same group element, different encoding?!)"
+                    );
                 } else {
                     eprintln!("GPU point != original point (WRONG point!)");
                     // Check what point it is
                     let gpu_recompress = gpu_point.compress();
-                    eprintln!("GPU point recompressed: {}", hex::encode(gpu_recompress.as_bytes()));
+                    eprintln!(
+                        "GPU point recompressed: {}",
+                        hex::encode(gpu_recompress.as_bytes())
+                    );
                 }
             }
             None => {
@@ -1821,19 +2105,46 @@ mod tests {
         let identity_scalar = Scalar::ZERO;
         let identity_point = &identity_scalar * RISTRETTO_BASEPOINT_TABLE;
         let identity_compressed = identity_point.compress();
-        eprintln!("Identity compressed: {}", hex::encode(identity_compressed.as_bytes()));
+        eprintln!(
+            "Identity compressed: {}",
+            hex::encode(identity_compressed.as_bytes())
+        );
 
         // Also try the basepoint
         let bp_compressed = RISTRETTO_BASEPOINT_POINT.compress();
-        eprintln!("Basepoint compressed: {}", hex::encode(bp_compressed.as_bytes()));
+        eprintln!(
+            "Basepoint compressed: {}",
+            hex::encode(bp_compressed.as_bytes())
+        );
 
         // Extract basepoint coords and run our algorithm
         let bp_coords = extract_point_coords(&RISTRETTO_BASEPOINT_POINT);
-        let bp_x: [u64; 5] = [bp_coords[0], bp_coords[1], bp_coords[2], bp_coords[3], bp_coords[4]];
-        let bp_y: [u64; 5] = [bp_coords[5], bp_coords[6], bp_coords[7], bp_coords[8], bp_coords[9]];
-        let bp_z: [u64; 5] = [bp_coords[10], bp_coords[11], bp_coords[12], bp_coords[13], bp_coords[14]];
+        let bp_x: [u64; 5] = [
+            bp_coords[0],
+            bp_coords[1],
+            bp_coords[2],
+            bp_coords[3],
+            bp_coords[4],
+        ];
+        let bp_y: [u64; 5] = [
+            bp_coords[5],
+            bp_coords[6],
+            bp_coords[7],
+            bp_coords[8],
+            bp_coords[9],
+        ];
+        let bp_z: [u64; 5] = [
+            bp_coords[10],
+            bp_coords[11],
+            bp_coords[12],
+            bp_coords[13],
+            bp_coords[14],
+        ];
         // Check if Z is 1 (the basepoint might be in affine form)
-        eprintln!("Basepoint Z bytes: {}", hex::encode(limbs_to_bytes_v2(&bp_z)));
+        eprintln!(
+            "Basepoint Z bytes: {}",
+            hex::encode(limbs_to_bytes_v2(&bp_z))
+        );
         // Check if the basepoint is in affine form: Z should be [1,0,0,0,0]
         eprintln!("Basepoint Z limbs: {:?}", bp_z);
         eprintln!("Basepoint X limbs: {:?}", bp_x);
@@ -1855,7 +2166,13 @@ mod tests {
 
         // ===== Helper functions =====
         fn fe_add(f: &[u64; 5], g: &[u64; 5]) -> [u64; 5] {
-            [f[0]+g[0], f[1]+g[1], f[2]+g[2], f[3]+g[3], f[4]+g[4]]
+            [
+                f[0] + g[0],
+                f[1] + g[1],
+                f[2] + g[2],
+                f[3] + g[3],
+                f[4] + g[4],
+            ]
         }
         fn fe_sub(f: &[u64; 5], g: &[u64; 5]) -> [u64; 5] {
             let mask: u64 = (1u64 << 51) - 1;
@@ -1868,40 +2185,92 @@ mod tests {
             ]
         }
         fn fe_mul(f: &[u64; 5], g: &[u64; 5]) -> [u64; 5] {
-            let (f0,f1,f2,f3,f4) = (f[0],f[1],f[2],f[3],f[4]);
-            let (g0,g1,g2,g3,g4) = (g[0],g[1],g[2],g[3],g[4]);
-            let (g1_19, g2_19, g3_19, g4_19) = (g1*19, g2*19, g3*19, g4*19);
-            let h0: u128 = f0 as u128*g0 as u128 + f1 as u128*g4_19 as u128 + f2 as u128*g3_19 as u128 + f3 as u128*g2_19 as u128 + f4 as u128*g1_19 as u128;
-            let h1: u128 = f0 as u128*g1 as u128 + f1 as u128*g0 as u128 + f2 as u128*g4_19 as u128 + f3 as u128*g3_19 as u128 + f4 as u128*g2_19 as u128;
-            let h2: u128 = f0 as u128*g2 as u128 + f1 as u128*g1 as u128 + f2 as u128*g0 as u128 + f3 as u128*g4_19 as u128 + f4 as u128*g3_19 as u128;
-            let h3: u128 = f0 as u128*g3 as u128 + f1 as u128*g2 as u128 + f2 as u128*g1 as u128 + f3 as u128*g0 as u128 + f4 as u128*g4_19 as u128;
-            let h4: u128 = f0 as u128*g4 as u128 + f1 as u128*g3 as u128 + f2 as u128*g2 as u128 + f3 as u128*g1 as u128 + f4 as u128*g0 as u128;
+            let (f0, f1, f2, f3, f4) = (f[0], f[1], f[2], f[3], f[4]);
+            let (g0, g1, g2, g3, g4) = (g[0], g[1], g[2], g[3], g[4]);
+            let (g1_19, g2_19, g3_19, g4_19) = (g1 * 19, g2 * 19, g3 * 19, g4 * 19);
+            let h0: u128 = f0 as u128 * g0 as u128
+                + f1 as u128 * g4_19 as u128
+                + f2 as u128 * g3_19 as u128
+                + f3 as u128 * g2_19 as u128
+                + f4 as u128 * g1_19 as u128;
+            let h1: u128 = f0 as u128 * g1 as u128
+                + f1 as u128 * g0 as u128
+                + f2 as u128 * g4_19 as u128
+                + f3 as u128 * g3_19 as u128
+                + f4 as u128 * g2_19 as u128;
+            let h2: u128 = f0 as u128 * g2 as u128
+                + f1 as u128 * g1 as u128
+                + f2 as u128 * g0 as u128
+                + f3 as u128 * g4_19 as u128
+                + f4 as u128 * g3_19 as u128;
+            let h3: u128 = f0 as u128 * g3 as u128
+                + f1 as u128 * g2 as u128
+                + f2 as u128 * g1 as u128
+                + f3 as u128 * g0 as u128
+                + f4 as u128 * g4_19 as u128;
+            let h4: u128 = f0 as u128 * g4 as u128
+                + f1 as u128 * g3 as u128
+                + f2 as u128 * g2 as u128
+                + f3 as u128 * g1 as u128
+                + f4 as u128 * g0 as u128;
             let mask: u64 = (1u64 << 51) - 1;
-            let c = (h0 >> 51) as u64; let v0 = h0 as u64 & mask; let h1 = h1 + c as u128;
-            let c = (h1 >> 51) as u64; let v1 = h1 as u64 & mask; let h2 = h2 + c as u128;
-            let c = (h2 >> 51) as u64; let v2 = h2 as u64 & mask; let h3 = h3 + c as u128;
-            let c = (h3 >> 51) as u64; let v3 = h3 as u64 & mask; let h4 = h4 + c as u128;
-            let c = (h4 >> 51) as u64; let v4 = h4 as u64 & mask;
-            let mut r = [v0 + c*19, v1, v2, v3, v4];
-            let c2 = r[0] >> 51; r[0] &= mask; r[1] += c2;
+            let c = (h0 >> 51) as u64;
+            let v0 = h0 as u64 & mask;
+            let h1 = h1 + c as u128;
+            let c = (h1 >> 51) as u64;
+            let v1 = h1 as u64 & mask;
+            let h2 = h2 + c as u128;
+            let c = (h2 >> 51) as u64;
+            let v2 = h2 as u64 & mask;
+            let h3 = h3 + c as u128;
+            let c = (h3 >> 51) as u64;
+            let v3 = h3 as u64 & mask;
+            let h4 = h4 + c as u128;
+            let c = (h4 >> 51) as u64;
+            let v4 = h4 as u64 & mask;
+            let mut r = [v0 + c * 19, v1, v2, v3, v4];
+            let c2 = r[0] >> 51;
+            r[0] &= mask;
+            r[1] += c2;
             r
         }
         fn fe_sq(f: &[u64; 5]) -> [u64; 5] {
-            let (f0,f1,f2,f3,f4) = (f[0],f[1],f[2],f[3],f[4]);
-            let f0_2 = f0 * 2; let f1_2 = f1 * 2;
-            let h0: u128 = f0 as u128*f0 as u128 + (f1*38) as u128*f4 as u128 + (f2*38) as u128*f3 as u128;
-            let h1: u128 = f0_2 as u128*f1 as u128 + (f2*38) as u128*f4 as u128 + (f3*19) as u128*f3 as u128;
-            let h2: u128 = f0_2 as u128*f2 as u128 + f1 as u128*f1 as u128 + (f3*38) as u128*f4 as u128;
-            let h3: u128 = f0_2 as u128*f3 as u128 + f1_2 as u128*f2 as u128 + (f4*19) as u128*f4 as u128;
-            let h4: u128 = f0_2 as u128*f4 as u128 + f1_2 as u128*f3 as u128 + f2 as u128*f2 as u128;
+            let (f0, f1, f2, f3, f4) = (f[0], f[1], f[2], f[3], f[4]);
+            let f0_2 = f0 * 2;
+            let f1_2 = f1 * 2;
+            let h0: u128 = f0 as u128 * f0 as u128
+                + (f1 * 38) as u128 * f4 as u128
+                + (f2 * 38) as u128 * f3 as u128;
+            let h1: u128 = f0_2 as u128 * f1 as u128
+                + (f2 * 38) as u128 * f4 as u128
+                + (f3 * 19) as u128 * f3 as u128;
+            let h2: u128 = f0_2 as u128 * f2 as u128
+                + f1 as u128 * f1 as u128
+                + (f3 * 38) as u128 * f4 as u128;
+            let h3: u128 = f0_2 as u128 * f3 as u128
+                + f1_2 as u128 * f2 as u128
+                + (f4 * 19) as u128 * f4 as u128;
+            let h4: u128 =
+                f0_2 as u128 * f4 as u128 + f1_2 as u128 * f3 as u128 + f2 as u128 * f2 as u128;
             let mask: u64 = (1u64 << 51) - 1;
-            let c = (h0 >> 51) as u64; let v0 = h0 as u64 & mask; let h1 = h1 + c as u128;
-            let c = (h1 >> 51) as u64; let v1 = h1 as u64 & mask; let h2 = h2 + c as u128;
-            let c = (h2 >> 51) as u64; let v2 = h2 as u64 & mask; let h3 = h3 + c as u128;
-            let c = (h3 >> 51) as u64; let v3 = h3 as u64 & mask; let h4 = h4 + c as u128;
-            let c = (h4 >> 51) as u64; let v4 = h4 as u64 & mask;
-            let mut r = [v0 + c*19, v1, v2, v3, v4];
-            let c2 = r[0] >> 51; r[0] &= mask; r[1] += c2;
+            let c = (h0 >> 51) as u64;
+            let v0 = h0 as u64 & mask;
+            let h1 = h1 + c as u128;
+            let c = (h1 >> 51) as u64;
+            let v1 = h1 as u64 & mask;
+            let h2 = h2 + c as u128;
+            let c = (h2 >> 51) as u64;
+            let v2 = h2 as u64 & mask;
+            let h3 = h3 + c as u128;
+            let c = (h3 >> 51) as u64;
+            let v3 = h3 as u64 & mask;
+            let h4 = h4 + c as u128;
+            let c = (h4 >> 51) as u64;
+            let v4 = h4 as u64 & mask;
+            let mut r = [v0 + c * 19, v1, v2, v3, v4];
+            let c2 = r[0] >> 51;
+            r[0] &= mask;
+            r[1] += c2;
             r
         }
         fn fe_tobytes(v: &[u64; 5]) -> [u8; 32] {
@@ -1909,12 +2278,24 @@ mod tests {
             let mask: u64 = (1u64 << 51) - 1;
             // carry
             let mut c: u64;
-            c = h[0] >> 51; h[0] &= mask; h[1] += c;
-            c = h[1] >> 51; h[1] &= mask; h[2] += c;
-            c = h[2] >> 51; h[2] &= mask; h[3] += c;
-            c = h[3] >> 51; h[3] &= mask; h[4] += c;
-            c = h[4] >> 51; h[4] &= mask; h[0] += c * 19;
-            c = h[0] >> 51; h[0] &= mask; h[1] += c;
+            c = h[0] >> 51;
+            h[0] &= mask;
+            h[1] += c;
+            c = h[1] >> 51;
+            h[1] &= mask;
+            h[2] += c;
+            c = h[2] >> 51;
+            h[2] &= mask;
+            h[3] += c;
+            c = h[3] >> 51;
+            h[3] &= mask;
+            h[4] += c;
+            c = h[4] >> 51;
+            h[4] &= mask;
+            h[0] += c * 19;
+            c = h[0] >> 51;
+            h[0] &= mask;
+            h[1] += c;
             // reduce
             let mut q = (h[0] + 19) >> 51;
             q = (h[1] + q) >> 51;
@@ -1922,10 +2303,18 @@ mod tests {
             q = (h[3] + q) >> 51;
             q = (h[4] + q) >> 51;
             h[0] += q * 19;
-            c = h[0] >> 51; h[0] &= mask; h[1] += c;
-            c = h[1] >> 51; h[1] &= mask; h[2] += c;
-            c = h[2] >> 51; h[2] &= mask; h[3] += c;
-            c = h[3] >> 51; h[3] &= mask; h[4] += c;
+            c = h[0] >> 51;
+            h[0] &= mask;
+            h[1] += c;
+            c = h[1] >> 51;
+            h[1] &= mask;
+            h[2] += c;
+            c = h[2] >> 51;
+            h[2] &= mask;
+            h[3] += c;
+            c = h[3] >> 51;
+            h[3] &= mask;
+            h[4] += c;
             h[4] &= mask;
             // pack
             let lo0 = h[0] | (h[1] << 51);
@@ -1963,11 +2352,17 @@ mod tests {
             fe_tobytes(f) == fe_tobytes(g)
         }
         fn fe_abs(f: &[u64; 5]) -> [u64; 5] {
-            if fe_isneg(f) { fe_neg(f) } else { *f }
+            if fe_isneg(f) {
+                fe_neg(f)
+            } else {
+                *f
+            }
         }
         fn fe_sq_n(f: &[u64; 5], n: usize) -> [u64; 5] {
             let mut h = fe_sq(f);
-            for _ in 1..n { h = fe_sq(&h); }
+            for _ in 1..n {
+                h = fe_sq(&h);
+            }
             h
         }
         fn fe_pow22523(f: &[u64; 5]) -> [u64; 5] {
@@ -1995,8 +2390,20 @@ mod tests {
             fe_mul(&t0, f)
         }
 
-        let sqrt_m1: [u64; 5] = [1718705420411056, 234908883556509, 2233514472574048, 2117202627021982, 765476049583133];
-        let invsqrt_a_minus_d: [u64; 5] = [278908739862762, 821645201101625, 8113234426968, 1777959178193151, 2118520810568447];
+        let sqrt_m1: [u64; 5] = [
+            1718705420411056,
+            234908883556509,
+            2233514472574048,
+            2117202627021982,
+            765476049583133,
+        ];
+        let invsqrt_a_minus_d: [u64; 5] = [
+            278908739862762,
+            821645201101625,
+            8113234426968,
+            1777959178193151,
+            2118520810568447,
+        ];
 
         // ===== Step 0: Verify field arithmetic basics =====
         // SQRT_M1^2 should equal -1 (= p-1)
@@ -2004,12 +2411,14 @@ mod tests {
         let sqrt_m1_sq_bytes = fe_tobytes(&sqrt_m1_sq);
         // p-1 in LE bytes
         let p_minus_1: [u8; 32] = [
-            0xec, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff,
-            0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff,
-            0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff,
-            0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0x7f,
+            0xec, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff,
+            0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff,
+            0xff, 0xff, 0xff, 0x7f,
         ];
-        assert_eq!(sqrt_m1_sq_bytes, p_minus_1, "SQRT_M1^2 != -1 -- field arithmetic is broken!");
+        assert_eq!(
+            sqrt_m1_sq_bytes, p_minus_1,
+            "SQRT_M1^2 != -1 -- field arithmetic is broken!"
+        );
         eprintln!("SQRT_M1^2 == -1 (p-1): PASS");
 
         // ===== Step 1: Verify coordinate layout =====
@@ -2044,26 +2453,37 @@ mod tests {
 
         for zi in 0..4 {
             for yi in 0..4 {
-                if zi == yi { continue; }
+                if zi == yi {
+                    continue;
+                }
                 let product = fe_mul(&y_from_edwards, &fields[zi]);
                 if fe_equal(&product, &fields[yi]) {
-                    eprintln!("Layout check: y_edwards * {} == {} => Y={}, Z={}",
-                        field_names[zi], field_names[yi], field_names[yi], field_names[zi]);
+                    eprintln!(
+                        "Layout check: y_edwards * {} == {} => Y={}, Z={}",
+                        field_names[zi], field_names[yi], field_names[yi], field_names[zi]
+                    );
                     y_idx = yi;
                     z_idx = zi;
                     found_y = true;
                 }
             }
         }
-        assert!(found_y, "Could not find Y,Z fields matching CompressedEdwardsY!");
+        assert!(
+            found_y,
+            "Could not find Y,Z fields matching CompressedEdwardsY!"
+        );
 
         // Now determine X and T from Edwards invariant T*Z = X*Y
         let mut x_idx = usize::MAX;
         let mut t_idx = usize::MAX;
         for xi in 0..4 {
-            if xi == y_idx || xi == z_idx { continue; }
+            if xi == y_idx || xi == z_idx {
+                continue;
+            }
             for ti in 0..4 {
-                if ti == y_idx || ti == z_idx || ti == xi { continue; }
+                if ti == y_idx || ti == z_idx || ti == xi {
+                    continue;
+                }
                 let xy = fe_mul(&fields[xi], &fields[y_idx]);
                 let tz = fe_mul(&fields[ti], &fields[z_idx]);
                 if fe_equal(&xy, &tz) {
@@ -2072,19 +2492,29 @@ mod tests {
                     // We check: is X*Z^{-1} negative? We can check X*Z_inv but
                     // we don't have inversion. Instead check: for x_sign to match,
                     // if we had x, isneg(x) should equal x_sign.
-                    eprintln!("Edwards invariant: {}*{} == {}*{} => X={}, T={}",
-                        field_names[xi], field_names[y_idx],
-                        field_names[ti], field_names[z_idx],
-                        field_names[xi], field_names[ti]);
+                    eprintln!(
+                        "Edwards invariant: {}*{} == {}*{} => X={}, T={}",
+                        field_names[xi],
+                        field_names[y_idx],
+                        field_names[ti],
+                        field_names[z_idx],
+                        field_names[xi],
+                        field_names[ti]
+                    );
                     x_idx = xi;
                     t_idx = ti;
                 }
             }
         }
-        assert!(x_idx != usize::MAX, "Could not determine X,T from Edwards invariant");
+        assert!(
+            x_idx != usize::MAX,
+            "Could not determine X,T from Edwards invariant"
+        );
 
-        eprintln!("Determined layout: X=fields[{}], Y=fields[{}], Z=fields[{}], T=fields[{}]",
-            x_idx, y_idx, z_idx, t_idx);
+        eprintln!(
+            "Determined layout: X=fields[{}], Y=fields[{}], Z=fields[{}], T=fields[{}]",
+            x_idx, y_idx, z_idx, t_idx
+        );
 
         let assumed_correct = x_idx == 0 && y_idx == 1 && z_idx == 2 && t_idx == 3;
         if !assumed_correct {
@@ -2138,8 +2568,10 @@ mod tests {
         let inv = fe_abs(&r);
         let was_sq = correct_sign || flipped_sign;
 
-        eprintln!("sqrt_ratio: correct={} flipped={} flipped_i={} was_sq={}",
-            correct_sign, flipped_sign, flipped_sign_i, was_sq);
+        eprintln!(
+            "sqrt_ratio: correct={} flipped={} flipped_i={} was_sq={}",
+            correct_sign, flipped_sign, flipped_sign_i, was_sq
+        );
 
         // den1 = inv * u1, den2 = inv * u2
         let den1 = fe_mul(&inv, &u1);
@@ -2161,18 +2593,26 @@ mod tests {
 
         // conditional rotation
         let mut x = x_limbs;
-        if rotate { x = iy0; }
+        if rotate {
+            x = iy0;
+        }
         let mut y = y_limbs;
-        if rotate { y = ix0; }
+        if rotate {
+            y = ix0;
+        }
         let mut den_inv = den2;
-        if rotate { den_inv = ench_den; }
+        if rotate {
+            den_inv = ench_den;
+        }
 
         // neg_y = isneg(x * z_inv)
         let x_zinv = fe_mul(&x, &z_inv);
         let neg_y = fe_isneg(&x_zinv);
 
         let mut y_final = y;
-        if neg_y { y_final = fe_neg(&y); }
+        if neg_y {
+            y_final = fe_neg(&y);
+        }
 
         // s = |den_inv * (Z - y_final)|
         let z_minus_y = fe_sub(&z_limbs, &y_final);
@@ -2184,7 +2624,10 @@ mod tests {
 
         eprintln!("rotate={} neg_y={}", rotate, neg_y);
         eprintln!("Our  compressed: {}", hex::encode(our_compressed));
-        eprintln!("Dalek compressed: {}", hex::encode(dalek_compressed.as_bytes()));
+        eprintln!(
+            "Dalek compressed: {}",
+            hex::encode(dalek_compressed.as_bytes())
+        );
 
         if our_compressed != *dalek_compressed.as_bytes() {
             // Check if valid
@@ -2276,9 +2719,9 @@ mod tests {
         assert_eq!(base58_char_values(b'1'), vec![0]);
         // 'a' -> both 'A' (index 9) and 'a' (index 33)
         let vals = base58_char_values(b'a');
-        assert!(vals.contains(&9));  // 'A' is at index 9
+        assert!(vals.contains(&9)); // 'A' is at index 9
         assert!(vals.contains(&33)); // 'a' is at index 33
-        // '2' is digit 1
+                                     // '2' is digit 1
         assert_eq!(base58_char_values(b'2'), vec![1]);
     }
 
@@ -2286,11 +2729,17 @@ mod tests {
     fn test_compute_prefix_ranges_basic() {
         // A single-char prefix should produce some ranges
         let ranges = compute_prefix_ranges("b");
-        assert!(!ranges.is_empty(), "expected non-empty ranges for prefix 'b'");
+        assert!(
+            !ranges.is_empty(),
+            "expected non-empty ranges for prefix 'b'"
+        );
         // Ranges should be sorted and non-overlapping
         for i in 1..ranges.len() {
-            assert!(u512_cmp(&ranges[i-1].1, &ranges[i].0) != std::cmp::Ordering::Greater,
-                "ranges not sorted/non-overlapping at index {}", i);
+            assert!(
+                u512_cmp(&ranges[i - 1].1, &ranges[i].0) != std::cmp::Ordering::Greater,
+                "ranges not sorted/non-overlapping at index {}",
+                i
+            );
         }
     }
 
@@ -2319,11 +2768,18 @@ mod tests {
                 u512_cmp(&combined, lo) != std::cmp::Ordering::Less
                     && u512_cmp(&combined, hi) == std::cmp::Ordering::Less
             });
+            let range_match_split =
+                prefix_match_ranges_split(spend_pub.as_bytes(), view_pub.as_bytes(), &ranges);
 
             assert_eq!(
                 range_match, bs58_match,
                 "range vs bs58 disagree for addr={} (range={}, bs58={})",
                 address, range_match, bs58_match
+            );
+            assert_eq!(
+                range_match_split, range_match,
+                "split range matcher disagrees for addr={} (split={}, classic={})",
+                address, range_match_split, range_match
             );
         }
     }
@@ -2374,9 +2830,7 @@ mod tests {
     fn test_gpu_range_match_agrees_with_cpu() {
         // Upload generator table
         let gen_table = build_gen_table();
-        let rc = unsafe {
-            cuda_init_gen_table(gen_table.as_ptr(), TABLE_BITS as i32)
-        };
+        let rc = unsafe { cuda_init_gen_table(gen_table.as_ptr(), TABLE_BITS as i32) };
         assert_eq!(rc, 0);
 
         let start_scalar = Scalar::from(77u64);
@@ -2414,12 +2868,17 @@ mod tests {
         let rc = unsafe {
             cuda_worker_set_ranges(
                 handle,
-                if prefix_ranges_flat.is_empty() { std::ptr::null() } else { prefix_ranges_flat.as_ptr() },
+                if prefix_ranges_flat.is_empty() {
+                    std::ptr::null()
+                } else {
+                    prefix_ranges_flat.as_ptr()
+                },
                 prefix_ranges.len() as i32,
                 0, // no suffix
                 std::ptr::null(),
                 0,
-                0, 0,
+                0,
+                0,
             )
         };
         assert_eq!(rc, 0, "cuda_worker_set_ranges failed");
@@ -2437,9 +2896,8 @@ mod tests {
         };
         assert_eq!(rc, 0, "cuda_worker_submit_v2 failed");
 
-        let flags = unsafe {
-            std::slice::from_raw_parts(cuda_worker_get_flags(handle), batch_size)
-        };
+        let flags =
+            unsafe { std::slice::from_raw_parts(cuda_worker_get_flags(handle), batch_size) };
 
         // Verify every GPU match/non-match against CPU
         let mut match_count = 0;
@@ -2467,9 +2925,14 @@ mod tests {
             }
         }
 
-        assert!(match_count > 0, "no matches found in 4096 candidates with prefix 'b'");
+        assert!(
+            match_count > 0,
+            "no matches found in 4096 candidates with prefix 'b'"
+        );
 
-        unsafe { cuda_worker_destroy(handle); }
+        unsafe {
+            cuda_worker_destroy(handle);
+        }
     }
 
     #[cfg(all(feature = "cuda", target_os = "linux"))]
@@ -2477,9 +2940,7 @@ mod tests {
     fn test_gpu_suffix_range_match() {
         // Upload generator table
         let gen_table = build_gen_table();
-        let rc = unsafe {
-            cuda_init_gen_table(gen_table.as_ptr(), TABLE_BITS as i32)
-        };
+        let rc = unsafe { cuda_init_gen_table(gen_table.as_ptr(), TABLE_BITS as i32) };
         assert_eq!(rc, 0);
 
         let start_scalar = Scalar::from(42u64);
@@ -2520,7 +2981,8 @@ mod tests {
             let rc = unsafe {
                 cuda_worker_set_ranges(
                     handle,
-                    std::ptr::null(), 0, // no prefix
+                    std::ptr::null(),
+                    0, // no prefix
                     suffix_modulus,
                     suffix_targets.as_ptr(),
                     suffix_targets.len() as i32,
@@ -2543,9 +3005,8 @@ mod tests {
             };
             assert_eq!(rc, 0, "cuda_worker_submit_v2 failed");
 
-            let flags = unsafe {
-                std::slice::from_raw_parts(cuda_worker_get_flags(handle), batch_size)
-            };
+            let flags =
+                unsafe { std::slice::from_raw_parts(cuda_worker_get_flags(handle), batch_size) };
 
             let mut match_count = 0;
             for i in 0..batch_size {
@@ -2566,15 +3027,21 @@ mod tests {
                     suffix, i, gpu_match, cpu_match, address
                 );
 
-                if gpu_match { match_count += 1; }
+                if gpu_match {
+                    match_count += 1;
+                }
             }
 
             total_match_count += match_count;
-            unsafe { cuda_worker_destroy(handle); }
+            unsafe {
+                cuda_worker_destroy(handle);
+            }
         }
 
         // Across all tested suffixes, we should find some matches
-        assert!(total_match_count > 0,
-            "no suffix matches found across all tested suffixes");
+        assert!(
+            total_match_count > 0,
+            "no suffix matches found across all tested suffixes"
+        );
     }
 }

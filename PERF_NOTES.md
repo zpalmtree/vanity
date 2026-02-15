@@ -1,0 +1,85 @@
+# Performance Notes (2026-02-15)
+
+## Scope
+This run focused on speed across:
+- CPU backend hot loop
+- CUDA vanity kernel prefix/suffix matching
+- CUDA default worker tuning
+
+## Baseline (before changes)
+All measurements used:
+- pattern: `--prefix zzzzzzzz`
+- duration: `timeout 16s`
+- GPU batch: `8388608` unless noted
+- machine: RTX 3080 desktop (display-attached, non-exclusive)
+
+### Throughput snapshots
+- `--cuda -t 1`: `57,312,597 keys/s`
+- `--cuda -t 2`: `58,994,488 keys/s`
+- `--cuda -t 4`: `59,532,421 keys/s`
+- CPU `-t 1`: `132,437 keys/s`
+- CPU `-t 8`: `1,005,189 keys/s`
+
+### Batch-size sweep (before)
+- `batch=2,097,152`: `58,657,465 keys/s`
+- `batch=4,194,304`: `55,113,890 keys/s`
+- `batch=8,388,608`: `54,583,836 keys/s`
+- `batch=16,777,216`: `56,762,673 keys/s`
+
+## Changes implemented
+
+### 1) CPU backend fast matcher
+- Replaced per-key base58 encode/match with:
+  - precomputed prefix ranges
+  - binary-search range lookup on split bytes (`spend_pub || view_pub`)
+  - modular suffix match with precomputed shift/view offset
+- Kept legacy base58 loop only for prefixes starting with `'1'`.
+
+### 2) CUDA kernel matcher rewrite
+- Removed per-key `combined[64]` construction.
+- Added split-byte comparator for `spend_pub + view_pub` vs range bounds.
+- Replaced linear prefix range scan with binary search over sorted ranges.
+- Replaced linear suffix target scan with binary search.
+- Fixed suffix modular combine multiply to use 128-bit intermediate.
+
+### 3) CUDA default worker tuning
+- Default worker threads for CUDA mode changed to `2` (when `-t` not provided).
+- Manual override via `-t` is unchanged.
+
+## Validation
+- `cargo test --features cuda -- --test-threads=1`
+- Result: `28 passed, 0 failed`
+
+## Compile telemetry (release, CUDA)
+`vanity_kernel` ptxas changes:
+- stack frame: `568 -> 496 bytes`
+- spill stores: `648 -> 532 bytes`
+- spill loads: `648 -> 532 bytes`
+
+## Post-change benchmarks
+
+### Throughput snapshots
+- `--cuda -t 1`: `66,322,139 keys/s`
+- `--cuda -t 2`: `67,987,334 keys/s`
+- `--cuda -t 4`: `65,851,167 keys/s`
+- CPU `-t 1`: `255,862 keys/s`
+- CPU `-t 8`: `1,940,204 keys/s`
+
+### Batch-size sweep (after, `-t 2`)
+- `batch=2,097,152`: `60,934,166 keys/s`
+- `batch=4,194,304`: `64,571,342 keys/s`
+- `batch=8,388,608`: `76,709,206 keys/s`
+- `batch=16,777,216`: `76,174,753 keys/s`
+
+### Repeat runs (after, `batch=8,388,608`)
+- `-t 1`: `71,689,188`, `74,363,532`, `73,679,729`
+- `-t 2`: `78,742,778`, `70,527,020`, `75,007,801`
+- `-t 4`: `63,799,573`, `71,820,992`, `73,071,742`
+
+Observed medians:
+- `-t 1`: `73,679,729`
+- `-t 2`: `75,007,801`
+- `-t 4`: `71,820,992`
+
+## Notes on noise
+Desktop GPU processes (Xorg/browser/Discord) were active during runs, so single-run throughput is noisy. Median-over-repeats was used to pick default guidance.
