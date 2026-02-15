@@ -794,6 +794,9 @@ struct CudaWorker {
     char* d_suffix;
     uint8_t* d_flags;
 
+    // Pinned host memory for flag transfer
+    uint8_t* h_flags;
+
     // Range-based matching (replaces base58 encoding on GPU)
     uint8_t* d_prefix_ranges;    // num_prefix_ranges * 128 bytes (lo[64] || hi[64])
     int num_prefix_ranges;
@@ -859,6 +862,9 @@ extern "C" void* cuda_worker_create(
 
     // Allocate persistent device memory
     cudaMalloc(&w->d_flags, max_batch);
+
+    // Allocate pinned host memory for fast D→H flag transfer
+    cudaMallocHost(&w->h_flags, max_batch);
     cudaMalloc(&w->d_prefix, prefix_len > 0 ? prefix_len : 1);
     cudaMalloc(&w->d_suffix, suffix_len > 0 ? suffix_len : 1);
 
@@ -932,13 +938,13 @@ extern "C" int cuda_worker_set_ranges(
 }
 
 // Full GPU mode: submit a batch with starting point coordinates
+// Flags are stored in pinned host memory (retrieve with cuda_worker_get_flags)
 extern "C" int cuda_worker_submit_v2(
     void* handle,
     const u64* start_X, const u64* start_Y,
     const u64* start_Z, const u64* start_T,
     const uint8_t* view_pub,
-    int count,
-    uint8_t* out_flags
+    int count
 ) {
     CudaWorker* w = (CudaWorker*)handle;
     if (count > w->max_batch) return 1;
@@ -969,11 +975,17 @@ extern "C" int cuda_worker_submit_v2(
         w->d_flags
     );
 
-    // Copy flags back (sync required since host buffer isn't pinned)
-    cudaMemcpyAsync(out_flags, w->d_flags, count, cudaMemcpyDeviceToHost, s);
+    // Copy flags to pinned host memory and synchronize
+    cudaMemcpyAsync(w->h_flags, w->d_flags, count, cudaMemcpyDeviceToHost, s);
     cudaStreamSynchronize(s);
 
     return cudaGetLastError() == cudaSuccess ? 0 : 2;
+}
+
+// Get pointer to pinned host flag buffer (valid after submit_v2 returns)
+extern "C" const uint8_t* cuda_worker_get_flags(void* handle) {
+    CudaWorker* w = (CudaWorker*)handle;
+    return w->h_flags;
 }
 
 // Legacy mode: submit pre-generated key pairs
@@ -1021,6 +1033,7 @@ extern "C" void cuda_worker_destroy(void* handle) {
     if (w->d_prefix_ranges) cudaFree(w->d_prefix_ranges);
     if (w->d_suffix_targets) cudaFree(w->d_suffix_targets);
     cudaFree(w->d_flags);
+    if (w->h_flags) cudaFreeHost(w->h_flags);
     cudaFree(w->d_prefix);
     cudaFree(w->d_suffix);
     cudaStreamDestroy(w->stream);

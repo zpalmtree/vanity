@@ -461,8 +461,9 @@ unsafe extern "C" {
         start_t: *const u64,
         view_pub: *const u8,
         count: i32,
-        out_flags: *mut u8,
     ) -> i32;
+
+    fn cuda_worker_get_flags(handle: *mut std::ffi::c_void) -> *const u8;
 
     #[allow(dead_code)]
     fn cuda_worker_destroy(handle: *mut std::ffi::c_void);
@@ -704,7 +705,8 @@ impl SearchBackend for CudaBackend {
                         return;
                     }
 
-                    let mut flags = vec![0u8; batch_size];
+                    // Get pointer to pinned host flag buffer (allocated by CUDA)
+                    let flags_ptr = unsafe { cuda_worker_get_flags(handle) };
 
                     loop {
                         // Extract starting point coordinates
@@ -721,7 +723,6 @@ impl SearchBackend for CudaBackend {
                                 coords[15..20].as_ptr(), // T
                                 view_pub_bytes.as_ptr(),
                                 batch_size as i32,
-                                flags.as_mut_ptr(),
                             )
                         };
 
@@ -730,7 +731,8 @@ impl SearchBackend for CudaBackend {
                             return;
                         }
 
-                        // Check for matches (very rare)
+                        // Check for matches in pinned host memory (very rare)
+                        let flags = unsafe { std::slice::from_raw_parts(flags_ptr, batch_size) };
                         for i in 0..batch_size {
                             if flags[i] == 0 {
                                 continue;
@@ -1354,7 +1356,6 @@ mod tests {
         };
         assert_eq!(rc, 0, "cuda_worker_set_ranges failed");
 
-        let mut flags = vec![0u8; batch_size];
         let rc = unsafe {
             cuda_worker_submit_v2(
                 handle,
@@ -1364,10 +1365,13 @@ mod tests {
                 coords[15..20].as_ptr(),
                 view_pub_bytes.as_ptr(),
                 batch_size as i32,
-                flags.as_mut_ptr(),
             )
         };
         assert_eq!(rc, 0, "cuda_worker_submit_v2 failed");
+
+        let flags = unsafe {
+            std::slice::from_raw_parts(cuda_worker_get_flags(handle), batch_size)
+        };
 
         // Verify every GPU match/non-match against CPU
         let mut match_count = 0;
@@ -2420,7 +2424,6 @@ mod tests {
         };
         assert_eq!(rc, 0, "cuda_worker_set_ranges failed");
 
-        let mut flags = vec![0u8; batch_size];
         let rc = unsafe {
             cuda_worker_submit_v2(
                 handle,
@@ -2430,10 +2433,13 @@ mod tests {
                 coords[15..20].as_ptr(),
                 view_pub_bytes.as_ptr(),
                 batch_size as i32,
-                flags.as_mut_ptr(),
             )
         };
         assert_eq!(rc, 0, "cuda_worker_submit_v2 failed");
+
+        let flags = unsafe {
+            std::slice::from_raw_parts(cuda_worker_get_flags(handle), batch_size)
+        };
 
         // Verify every GPU match/non-match against CPU
         let mut match_count = 0;
@@ -2524,7 +2530,6 @@ mod tests {
             };
             assert_eq!(rc, 0, "cuda_worker_set_ranges failed");
 
-            let mut flags = vec![0u8; batch_size];
             let rc = unsafe {
                 cuda_worker_submit_v2(
                     handle,
@@ -2534,10 +2539,13 @@ mod tests {
                     coords[15..20].as_ptr(),
                     view_pub_bytes.as_ptr(),
                     batch_size as i32,
-                    flags.as_mut_ptr(),
                 )
             };
             assert_eq!(rc, 0, "cuda_worker_submit_v2 failed");
+
+            let flags = unsafe {
+                std::slice::from_raw_parts(cuda_worker_get_flags(handle), batch_size)
+            };
 
             let mut match_count = 0;
             for i in 0..batch_size {
