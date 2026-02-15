@@ -209,19 +209,20 @@ __device__ void fe_frombytes(fe25519* h, const uint8_t* s) {
     h->v[4] = (lo3 >> 12) & mask;
 }
 
-// Check if field element is negative (odd)
+// Check if field element is negative (odd) - reduced limb check avoids fe_tobytes
 __device__ __forceinline__ int fe_isneg(const fe25519* f) {
-    uint8_t s[32];
-    fe_tobytes(s, f);
-    return s[0] & 1;
+    fe25519 t;
+    fe_copy(&t, f);
+    fe_reduce(&t);
+    return (int)(t.v[0] & 1);
 }
 
-// Check if field element is zero
+// Check if field element is zero - reduced limb check avoids fe_tobytes
 __device__ int fe_iszero(const fe25519* f) {
-    uint8_t s[32];
-    fe_tobytes(s, f);
-    uint8_t r = 0;
-    for (int i = 0; i < 32; i++) r |= s[i];
+    fe25519 t;
+    fe_copy(&t, f);
+    fe_reduce(&t);
+    u64 r = t.v[0] | t.v[1] | t.v[2] | t.v[3] | t.v[4];
     return r == 0;
 }
 
@@ -316,13 +317,15 @@ __device__ void fe_pow22523(fe25519* h, const fe25519* f) {
     fe_mul(h, &t0, f);        // h  = f^(2^252-3)
 }
 
-// fe_equal: returns 1 if f == g
+// fe_equal: returns 1 if f == g - reduced limb XOR avoids 2x fe_tobytes
 __device__ int fe_equal(const fe25519* f, const fe25519* g) {
-    uint8_t sf[32], sg[32];
-    fe_tobytes(sf, f);
-    fe_tobytes(sg, g);
-    uint8_t d = 0;
-    for (int i = 0; i < 32; i++) d |= sf[i] ^ sg[i];
+    fe25519 tf, tg;
+    fe_copy(&tf, f);
+    fe_copy(&tg, g);
+    fe_reduce(&tf);
+    fe_reduce(&tg);
+    u64 d = 0;
+    for (int i = 0; i < 5; i++) d |= tf.v[i] ^ tg.v[i];
     return d == 0;
 }
 
@@ -548,30 +551,56 @@ __device__ __forceinline__ char ascii_lower(char c) {
     return c;
 }
 
+// Base58 using radix-58^4 = 11,316,496 for ~4x fewer inner-loop iterations
+// Each "group" holds 4 base-58 digits packed into a u32.
+// Max intermediate value during carry: 255 + 11316495 * 256 = 2,896,982,975 < 2^32
+#define BASE58_POW4 11316496U
+
 __device__ int encode_base58_64(const uint8_t* input, char* out) {
-    uint8_t digits[96];
-    int index = 0;
+    uint32_t groups[24];  // enough for 64 bytes in base-58^4 (88 digits / 4 = 22, +margin)
+    int ngroups = 0;
 
     for (int i = 0; i < 64; ++i) {
-        int carry = (int)input[i];
-        for (int j = 0; j < index; ++j) {
-            carry += (int)digits[j] << 8;
-            digits[j] = (uint8_t)(carry % 58);
-            carry /= 58;
+        uint32_t carry = (uint32_t)input[i];
+        for (int j = 0; j < ngroups; ++j) {
+            uint64_t acc = (uint64_t)groups[j] * 256 + carry;
+            groups[j] = (uint32_t)(acc % BASE58_POW4);
+            carry = (uint32_t)(acc / BASE58_POW4);
         }
         while (carry > 0) {
-            digits[index++] = (uint8_t)(carry % 58);
-            carry /= 58;
+            groups[ngroups++] = (uint32_t)(carry % BASE58_POW4);
+            carry /= BASE58_POW4;
         }
     }
 
+    // Convert groups to individual base-58 digits (little-endian within each group)
+    uint8_t digits[96];
+    int ndigits = 0;
+    for (int g = 0; g < ngroups - 1; ++g) {
+        uint32_t val = groups[g];
+        digits[ndigits++] = (uint8_t)(val % 58); val /= 58;
+        digits[ndigits++] = (uint8_t)(val % 58); val /= 58;
+        digits[ndigits++] = (uint8_t)(val % 58); val /= 58;
+        digits[ndigits++] = (uint8_t)(val);
+    }
+    // Last group: don't emit leading zeros
+    if (ngroups > 0) {
+        uint32_t val = groups[ngroups - 1];
+        while (val > 0) {
+            digits[ndigits++] = (uint8_t)(val % 58);
+            val /= 58;
+        }
+    }
+
+    // Count leading zero bytes -> leading '1's
     int leading_zeros = 0;
     while (leading_zeros < 64 && input[leading_zeros] == 0) leading_zeros++;
-    for (int i = 0; i < leading_zeros; ++i) digits[index++] = 0;
+    for (int i = 0; i < leading_zeros; ++i) digits[ndigits++] = 0;
 
-    for (int i = 0; i < index; ++i)
-        out[i] = BASE58_ALPHABET_DEVICE[digits[index - 1 - i]];
-    return index;
+    // Reverse into output with alphabet mapping
+    for (int i = 0; i < ndigits; ++i)
+        out[i] = BASE58_ALPHABET_DEVICE[digits[ndigits - 1 - i]];
+    return ndigits;
 }
 
 
@@ -621,14 +650,18 @@ __global__ void match_kernel(
 // NEW: Full GPU vanity kernel - key generation + encoding + matching
 // ============================================================================
 
-// Generator multiples table: G, 2G, 4G, ..., 2^20*G  (21 entries)
+// Generator multiples table: G, 2G, 4G, ..., 2^23*G  (24 entries)
 // Set at init time from host
-#define TABLE_SIZE 21
+#define TABLE_SIZE 24
+
+// Each thread computes KEYS_PER_THREAD consecutive keys
+#define KEYS_PER_THREAD 8
+#define KPT_SHIFT 3  // log2(KEYS_PER_THREAD)
 
 __device__ ge25519_p3 d_gen_table[TABLE_SIZE];
 __device__ fe25519 d_view_pub_fe[1];  // not used directly, but view_pub bytes are
 
-__global__ void vanity_kernel(
+__global__ void __launch_bounds__(256, 2) vanity_kernel(
     // Starting point P (in extended Edwards coordinates, as 5 u64 limbs each)
     const u64* start_X, const u64* start_Y, const u64* start_Z, const u64* start_T,
     // View public key (compressed, 32 bytes) - constant across batch
@@ -636,13 +669,30 @@ __global__ void vanity_kernel(
     // Pattern matching
     const char* prefix_lower, int prefix_len,
     const char* suffix_lower, int suffix_len,
-    // Batch
+    // Batch: total number of keys (must be multiple of KEYS_PER_THREAD)
     int batch_size,
-    // Output: flags (1=match, 0=no match)
+    // Output: flags (1=match, 0=no match), indexed by key_index [0..batch_size)
     uint8_t* out_flags
 ) {
     int tid = (int)(blockIdx.x * blockDim.x + threadIdx.x);
-    if (tid >= batch_size) return;
+    int num_threads = batch_size >> KPT_SHIFT;  // batch_size / KEYS_PER_THREAD
+
+    // Load generator table into shared memory (all threads must participate before syncthreads)
+    __shared__ ge25519_p3 s_gen_table[TABLE_SIZE];
+    {
+        int total_u64s = TABLE_SIZE * 20;
+        const u64* src = (const u64*)d_gen_table;
+        u64* dst = (u64*)s_gen_table;
+        for (int i = threadIdx.x; i < total_u64s; i += blockDim.x) {
+            dst[i] = src[i];
+        }
+        __syncthreads();
+    }
+
+    if (tid >= num_threads) return;
+
+    // key_base = tid * KEYS_PER_THREAD
+    int key_base = tid << KPT_SHIFT;
 
     // 1. Load starting point
     ge25519_p3 point;
@@ -653,52 +703,66 @@ __global__ void vanity_kernel(
         point.T.v[i] = start_T[i];
     }
 
-    // 2. Add tid * G using precomputed table
-    // point += sum of d_gen_table[i] for each bit i set in tid
-    for (int bit = 0; bit < TABLE_SIZE; bit++) {
-        if ((tid >> bit) & 1) {
+    // 2. Add key_base * G using precomputed table
+    // Since key_base = tid << KPT_SHIFT, bits 0..(KPT_SHIFT-1) are always 0
+    // so we start scanning from bit KPT_SHIFT
+    for (int bit = KPT_SHIFT; bit < TABLE_SIZE; bit++) {
+        if ((key_base >> bit) & 1) {
             ge25519_p3 tmp;
-            ge_add(&tmp, &point, &d_gen_table[bit]);
+            ge_add(&tmp, &point, &s_gen_table[bit]);
             point = tmp;
         }
     }
 
-    // 3. Ristretto compress -> 32 bytes spend_pub
-    uint8_t spend_pub[32];
-    ristretto_encode(spend_pub, &point);
+    // 3. Process KEYS_PER_THREAD consecutive keys
+    // G = s_gen_table[0] (the generator point)
+    for (int k = 0; k < KEYS_PER_THREAD; k++) {
+        int key_index = key_base + k;
 
-    // 4. Combine: [spend_pub || view_pub] -> 64 bytes
-    uint8_t combined[64];
-    for (int i = 0; i < 32; i++) combined[i] = spend_pub[i];
-    for (int i = 0; i < 32; i++) combined[32 + i] = view_pub[i];
+        // For k > 0, increment point by G
+        if (k > 0) {
+            ge25519_p3 tmp;
+            ge_add(&tmp, &point, &s_gen_table[0]);
+            point = tmp;
+        }
 
-    // 5. Base58 encode
-    char addr[96];
-    int addr_len = encode_base58_64(combined, addr);
+        // Ristretto compress -> 32 bytes spend_pub
+        uint8_t spend_pub[32];
+        ristretto_encode(spend_pub, &point);
 
-    // 6. Pattern matching
-    bool prefix_ok = true;
-    if (prefix_len > 0) {
-        if (prefix_len > addr_len) { prefix_ok = false; }
-        else {
-            for (int i = 0; i < prefix_len; ++i) {
-                if (ascii_lower(addr[i]) != prefix_lower[i]) { prefix_ok = false; break; }
+        // Combine: [spend_pub || view_pub] -> 64 bytes
+        uint8_t combined[64];
+        for (int i = 0; i < 32; i++) combined[i] = spend_pub[i];
+        for (int i = 0; i < 32; i++) combined[32 + i] = view_pub[i];
+
+        // Base58 encode
+        char addr[96];
+        int addr_len = encode_base58_64(combined, addr);
+
+        // Pattern matching
+        bool prefix_ok = true;
+        if (prefix_len > 0) {
+            if (prefix_len > addr_len) { prefix_ok = false; }
+            else {
+                for (int i = 0; i < prefix_len; ++i) {
+                    if (ascii_lower(addr[i]) != prefix_lower[i]) { prefix_ok = false; break; }
+                }
             }
         }
-    }
 
-    bool suffix_ok = true;
-    if (prefix_ok && suffix_len > 0) {
-        if (suffix_len > addr_len) { suffix_ok = false; }
-        else {
-            int start = addr_len - suffix_len;
-            for (int i = 0; i < suffix_len; ++i) {
-                if (ascii_lower(addr[start + i]) != suffix_lower[i]) { suffix_ok = false; break; }
+        bool suffix_ok = true;
+        if (prefix_ok && suffix_len > 0) {
+            if (suffix_len > addr_len) { suffix_ok = false; }
+            else {
+                int start = addr_len - suffix_len;
+                for (int i = 0; i < suffix_len; ++i) {
+                    if (ascii_lower(addr[start + i]) != suffix_lower[i]) { suffix_ok = false; break; }
+                }
             }
         }
-    }
 
-    out_flags[tid] = (prefix_ok && suffix_ok) ? 1 : 0;
+        out_flags[key_index] = (prefix_ok && suffix_ok) ? 1 : 0;
+    }
 }
 
 
@@ -819,7 +883,8 @@ extern "C" int cuda_worker_submit_v2(
     cudaMemsetAsync(w->d_flags, 0, count, s);
 
     int threads = 256;
-    int blocks = (count + threads - 1) / threads;
+    int num_thread_groups = count / KEYS_PER_THREAD;  // count must be multiple of KEYS_PER_THREAD
+    int blocks = (num_thread_groups + threads - 1) / threads;
 
     vanity_kernel<<<blocks, threads, 0, s>>>(
         w->d_start_X, w->d_start_Y, w->d_start_Z, w->d_start_T,
@@ -948,6 +1013,19 @@ __global__ void verify_compress_kernel(
     uint8_t* out_compressed  // count * 32 bytes
 ) {
     int tid = (int)(blockIdx.x * blockDim.x + threadIdx.x);
+
+    // Load generator table into shared memory (all threads must participate before syncthreads)
+    __shared__ ge25519_p3 s_gen_table[TABLE_SIZE];
+    {
+        int total_u64s = TABLE_SIZE * 20;
+        const u64* src = (const u64*)d_gen_table;
+        u64* dst = (u64*)s_gen_table;
+        for (int i = threadIdx.x; i < total_u64s; i += blockDim.x) {
+            dst[i] = src[i];
+        }
+        __syncthreads();
+    }
+
     if (tid >= count) return;
 
     // Load starting point
@@ -963,7 +1041,7 @@ __global__ void verify_compress_kernel(
     for (int bit = 0; bit < TABLE_SIZE; bit++) {
         if ((tid >> bit) & 1) {
             ge25519_p3 tmp;
-            ge_add(&tmp, &point, &d_gen_table[bit]);
+            ge_add(&tmp, &point, &s_gen_table[bit]);
             point = tmp;
         }
     }

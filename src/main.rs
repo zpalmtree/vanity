@@ -19,7 +19,7 @@ use serde::Serialize;
 const BASE58_ALPHABET: &str = "123456789ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz";
 
 /// Maximum number of generator table entries (supports batch up to 2^TABLE_BITS)
-const TABLE_BITS: usize = 21;
+const TABLE_BITS: usize = 24;
 
 #[derive(Parser)]
 #[command(name = "blocknet-vanity")]
@@ -40,8 +40,8 @@ struct Args {
     #[arg(long)]
     cuda: bool,
 
-    /// GPU batch size (keys per kernel launch) [default: 1048576]
-    #[arg(long, default_value = "1048576")]
+    /// GPU batch size (keys per kernel launch) [default: 8388608]
+    #[arg(long, default_value = "8388608")]
     batch_size: usize,
 }
 
@@ -649,8 +649,9 @@ fn main() {
 
     let batch_size = if args.cuda {
         // Clamp batch size to max supported by table (2^TABLE_BITS)
+        // and round down to multiple of 8 (KEYS_PER_THREAD)
         let max_batch = 1 << TABLE_BITS;
-        args.batch_size.min(max_batch)
+        (args.batch_size.min(max_batch)) & !7
     } else {
         args.batch_size
     };
