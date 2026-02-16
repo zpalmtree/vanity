@@ -2,6 +2,11 @@ BINARY = blocknet-vanity
 
 CUDA ?= auto
 
+# Use native CPU features on macOS (Apple Silicon instruction scheduling)
+ifeq ($(shell uname -s),Darwin)
+export RUSTFLAGS += -C target-cpu=native
+endif
+
 ifeq ($(CUDA),1)
 all: build-cuda
 else ifeq ($(CUDA),0)
