@@ -676,7 +676,15 @@ __device__ __forceinline__ int cmp_combined_split_to_bound(
     return 0;
 }
 
-__global__ void __launch_bounds__(256, 2) vanity_kernel(
+#ifndef VANITY_PREFIX_LAUNCH_MIN_BLOCKS
+#define VANITY_PREFIX_LAUNCH_MIN_BLOCKS 1
+#endif
+
+#ifndef VANITY_GENERIC_LAUNCH_MIN_BLOCKS
+#define VANITY_GENERIC_LAUNCH_MIN_BLOCKS 2
+#endif
+
+__global__ void __launch_bounds__(256, VANITY_GENERIC_LAUNCH_MIN_BLOCKS) vanity_kernel(
     // Starting point P (in extended Edwards coordinates, as 5 u64 limbs each)
     const u64* start_X, const u64* start_Y, const u64* start_Z, const u64* start_T,
     // View public key (compressed, 32 bytes) - constant across batch
@@ -804,6 +812,83 @@ __global__ void __launch_bounds__(256, 2) vanity_kernel(
         }
 
         out_flags[key_index] = (prefix_ok && suffix_ok) ? 1 : 0;
+    }
+}
+
+__global__ void __launch_bounds__(256, VANITY_PREFIX_LAUNCH_MIN_BLOCKS) vanity_kernel_prefix(
+    const u64* start_X, const u64* start_Y, const u64* start_Z, const u64* start_T,
+    const uint8_t* view_pub,
+    const uint8_t* prefix_ranges, int num_prefix_ranges,
+    int batch_size,
+    uint8_t* out_flags
+) {
+    int tid = (int)(blockIdx.x * blockDim.x + threadIdx.x);
+    int num_threads = batch_size >> KPT_SHIFT;
+
+    __shared__ ge25519_p3 s_gen_table[TABLE_SIZE];
+    {
+        int total_u64s = TABLE_SIZE * 20;
+        const u64* src = (const u64*)d_gen_table;
+        u64* dst = (u64*)s_gen_table;
+        for (int i = threadIdx.x; i < total_u64s; i += blockDim.x) {
+            dst[i] = src[i];
+        }
+        __syncthreads();
+    }
+
+    if (tid >= num_threads) return;
+    int key_base = tid << KPT_SHIFT;
+
+    ge25519_p3 point;
+    #pragma unroll
+    for (int i = 0; i < 5; i++) {
+        point.X.v[i] = start_X[i];
+        point.Y.v[i] = start_Y[i];
+        point.Z.v[i] = start_Z[i];
+        point.T.v[i] = start_T[i];
+    }
+
+    for (int bit = KPT_SHIFT; bit < TABLE_SIZE; bit++) {
+        if ((key_base >> bit) & 1) {
+            ge25519_p3 tmp;
+            ge_add(&tmp, &point, &s_gen_table[bit]);
+            point = tmp;
+        }
+    }
+
+    for (int k = 0; k < KEYS_PER_THREAD; k++) {
+        int key_index = key_base + k;
+        if (k > 0) {
+            ge25519_p3 tmp;
+            ge_add(&tmp, &point, &s_gen_table[0]);
+            point = tmp;
+        }
+
+        uint8_t spend_pub[32];
+        ristretto_encode(spend_pub, &point);
+
+        bool prefix_ok = false;
+        int left = 0;
+        int right = num_prefix_ranges;
+        while (left < right) {
+            int mid = left + ((right - left) >> 1);
+            const uint8_t* lo = prefix_ranges + mid * 128;
+            int cmp_lo = cmp_combined_split_to_bound(spend_pub, view_pub, lo);
+            if (cmp_lo < 0) {
+                right = mid;
+                continue;
+            }
+
+            const uint8_t* hi = lo + 64;
+            int cmp_hi = cmp_combined_split_to_bound(spend_pub, view_pub, hi);
+            if (cmp_hi < 0) {
+                prefix_ok = true;
+                break;
+            }
+            left = mid + 1;
+        }
+
+        out_flags[key_index] = prefix_ok ? 1 : 0;
     }
 }
 
@@ -1008,15 +1093,28 @@ extern "C" int cuda_worker_submit_v2(
     int num_thread_groups = count / KEYS_PER_THREAD;  // count must be multiple of KEYS_PER_THREAD
     int blocks = (num_thread_groups + threads - 1) / threads;
 
-    vanity_kernel<<<blocks, threads, 0, s>>>(
-        w->d_start_X, w->d_start_Y, w->d_start_Z, w->d_start_T,
-        w->d_view_pub,
-        w->d_prefix_ranges, w->num_prefix_ranges,
-        w->suffix_modulus, w->d_suffix_targets, w->num_suffix_targets,
-        w->suffix_shift_mod, w->suffix_chunk_mul, w->suffix_view_offset,
-        count,
-        w->d_flags
-    );
+    if (w->num_prefix_ranges > 0 && w->num_suffix_targets == 0) {
+        vanity_kernel_prefix<<<blocks, threads, 0, s>>>(
+            w->d_start_X, w->d_start_Y, w->d_start_Z, w->d_start_T,
+            w->d_view_pub,
+            w->d_prefix_ranges, w->num_prefix_ranges,
+            count,
+            w->d_flags
+        );
+    } else if (w->num_prefix_ranges == 0 && w->num_suffix_targets == 0) {
+        // No prefix and no suffix: every key matches.
+        cudaMemsetAsync(w->d_flags, 1, count, s);
+    } else {
+        vanity_kernel<<<blocks, threads, 0, s>>>(
+            w->d_start_X, w->d_start_Y, w->d_start_Z, w->d_start_T,
+            w->d_view_pub,
+            w->d_prefix_ranges, w->num_prefix_ranges,
+            w->suffix_modulus, w->d_suffix_targets, w->num_suffix_targets,
+            w->suffix_shift_mod, w->suffix_chunk_mul, w->suffix_view_offset,
+            count,
+            w->d_flags
+        );
+    }
 
     // Copy flags to pinned host memory and synchronize
     cudaMemcpyAsync(w->h_flags, w->d_flags, count, cudaMemcpyDeviceToHost, s);

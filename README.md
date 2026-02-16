@@ -62,6 +62,14 @@ make all
 `make all` auto-detects CUDA on Linux when `nvcc` is installed.  
 Optional overrides: `make all CUDA=1` (force CUDA) or `make all CUDA=0` (force CPU).
 
+### CUDA optimization policy
+
+CUDA tuning is intentionally prefix-first:
+
+- We optimize for prefix throughput first, since production searches are predominantly prefix-based.
+- Small suffix deltas are acceptable when prefix gains are materially larger.
+- All CUDA optimization decisions are validated with strict interleaved A/B runs (warmup + cooldown), and results are logged in `PERF_NOTES.md`.
+
 ## run
 
 ```

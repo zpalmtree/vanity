@@ -232,3 +232,24 @@ Earlier short-window snapshots mixed peak and last-sample reporting and were noi
   - Delta: `-1,860,980` (`-3.45%`)
   - High variance observed across pairs (candidate had both large losses and one large win), so this path is not stable enough to ship.
 - Decision: rejected for now; keep baseline kernel behavior.
+
+### Attempt I (accepted): prefix-only specialization as default (prefix-first policy)
+- Change:
+  - default dispatch now uses dedicated prefix-only kernel when `num_prefix_ranges > 0 && num_suffix_targets == 0`.
+  - suffix-only and prefix+suffix continue using the generic `vanity_kernel`.
+- Strict interleaved A/B (`/tmp/vanity_ab_prefix_default_focus.csv`, 2 pairs/mode):
+  - baseline: commit `0e1feb5`
+  - candidate: prefix-only specialization default dispatch
+  - warmup `12s`, measure `24s`, cooldown `15s`
+  - fixed settings: `--cuda -t 2 --batch-size 8388608`
+- Aggregate (avg medians):
+  - Prefix: `73,977,773 -> 84,727,040` (`+10,749,267`, `+14.53%`)
+  - Suffix: `63,353,813 -> 63,260,534` (`-93,279`, `-0.15%`)
+- Decision: accepted and made default under prefix-first optimization policy.
+
+## Optimization policy update (2026-02-16)
+- We prioritize prefix throughput over suffix throughput for CUDA tuning decisions.
+- Acceptance rule for default path:
+  - significant prefix gain required
+  - suffix impact must remain small/near-flat under strict interleaved A/B
+- Benchmark source of truth remains strict interleaved runs captured by `scripts/bench_cuda_ab.sh`.
