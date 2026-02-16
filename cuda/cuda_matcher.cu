@@ -981,9 +981,6 @@ extern "C" int cuda_worker_submit_v2(
     cudaMemcpyAsync(w->d_start_T, start_T, 5*sizeof(u64), cudaMemcpyHostToDevice, s);
     cudaMemcpyAsync(w->d_view_pub, view_pub, 32, cudaMemcpyHostToDevice, s);
 
-    // Clear flags
-    cudaMemsetAsync(w->d_flags, 0, count, s);
-
     int threads = 256;
     int num_thread_groups = count / KEYS_PER_THREAD;  // count must be multiple of KEYS_PER_THREAD
     int blocks = (num_thread_groups + threads - 1) / threads;
@@ -1025,8 +1022,6 @@ extern "C" int cuda_worker_submit(
     size_t input_size = (size_t)count * 64;
 
     cudaMemcpyAsync(w->d_inputs, inputs, input_size, cudaMemcpyHostToDevice, s);
-    cudaMemsetAsync(w->d_flags, 0, count, s);
-
     int threads = 256;
     int blocks = (count + threads - 1) / threads;
 

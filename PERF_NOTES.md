@@ -118,3 +118,32 @@ Earlier short-window snapshots mixed peak and last-sample reporting and were noi
 - Suffix pair 2: `+1.84%`
 - Suffix pair 3: `+12.68%`
 - Suffix pair 4: `+0.11%`
+
+## 2026-02-15 additional CUDA optimization attempts
+
+### Attempt A (rejected): per-thread bitmask output instead of per-key flags
+- Idea: write one mask byte per `KEYS_PER_THREAD` to reduce D→H copy and host scan cost.
+- Result (`/tmp/vanity_ab_mask.csv`, interleaved A/B, 3 pairs, 20s rounds):
+  - Prefix avg median regressed (`70.2M -> 63.2M`, about `-10%`).
+  - Suffix avg median improved (`63.1M -> 68.9M`, about `+9%`).
+- Decision: rejected due prefix regression (not acceptable for mixed workloads).
+
+### Attempt B (rejected): vanity kernel launch at 128 threads/block
+- Idea: lower block size from `256` to `128` for scheduling/occupancy tradeoff.
+- Result (`/tmp/vanity_ab_threads128_quick.csv`, interleaved A/B, 2 pairs, 15s rounds):
+  - Prefix avg median regressed (`68.4M -> 64.1M`).
+  - Suffix avg median regressed (`67.5M -> 58.2M`).
+- Decision: rejected.
+
+### Attempt C (accepted): remove redundant `cudaMemsetAsync` before kernels
+- Change:
+  - Removed pre-launch clear in `cuda_worker_submit_v2` (full GPU path).
+  - Removed pre-launch clear in `cuda_worker_submit` (legacy path).
+  - Rationale: both kernels write every output slot each launch.
+- Result (`/tmp/vanity_ab_no_memset.csv`, interleaved A/B, 3 pairs, 20s rounds):
+  - Prefix avg median: `69,383,952 -> 76,487,549` (`+10.24%`)
+  - Suffix avg median: `70,583,312 -> 76,742,800` (`+8.73%`)
+  - Pairwise medians:
+    - Prefix: `+11.80%`, `-3.49%`, `+23.59%`
+    - Suffix: `+3.07%`, `+5.67%`, `+18.83%`
+- Decision: accepted.
