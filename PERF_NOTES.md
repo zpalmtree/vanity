@@ -187,3 +187,48 @@ Earlier short-window snapshots mixed peak and last-sample reporting and were noi
   - Prefix: `+3.96%`, `+12.33%`, `+3.94%`
   - Suffix: `+3.73%`, `+2.60%`, `+8.69%`
 - Decision: accepted.
+
+## 2026-02-16 profiling harness + expanded rewrite attempts
+
+### Benchmark harness update (accepted)
+- Added `scripts/bench_cuda_ab.sh` for strict interleaved CUDA A/B runs.
+- Harness features:
+  - alternating baseline/candidate order per pair
+  - warmup + measured windows with cooldown gaps
+  - per-run median/mean/min/max capture from progress samples
+  - raw CSV + per-run log file paths
+  - mode filter (`--modes prefix,suffix`) for isolated validation
+
+### Attempt G (rejected): full rewrite bundle
+- Candidate bundle included:
+  - split kernels for prefix-only / suffix-only / both
+  - packed 64-bit prefix comparator
+  - reciprocal-based byte-step suffix reduction
+  - startup CUDA init/autotune plumbing
+  - ptxas knob surface (`CUDA_LAUNCH_MIN_BLOCKS`, `CUDA_MAXRREGCOUNT`)
+- Strict interleaved A/B (`/tmp/vanity_ab_do_them_all.csv`):
+  - baseline: commit `0e1feb5`
+  - candidate: full rewrite bundle
+  - warmup `12s`, measure `24s`, cooldown `15s`, `3` pairs/mode
+  - fixed settings: `--cuda -t 2 --batch-size 8388608`
+- Aggregate (avg medians):
+  - Prefix: `59,282,461 -> 54,040,291` (`-5,242,169`, `-8.84%`)
+  - Suffix: `60,927,988 -> 58,668,803` (`-2,259,185`, `-3.71%`)
+- Pairwise deltas:
+  - Prefix: `-6.82%`, `-3.06%`, `-16.47%`
+  - Suffix: `-3.65%`, `-4.64%`, `-2.86%`
+- Decision: rejected.
+
+### Attempt H (rejected): prefix-only specialized kernel with generic fallback
+- Change:
+  - kept baseline generic `vanity_kernel` for suffix/both
+  - added dedicated prefix-only kernel + dispatch split
+- Interleaved A/B (`/tmp/vanity_ab_prefix_only_specialized_clean.csv`, 2 pairs/mode):
+  - Prefix avg medians: `63,094,584 -> 77,034,185` (`+22.10%`)
+  - Suffix avg medians: `57,719,110 -> 56,398,068` (`-2.29%`)
+- Suffix-only confirmation (`/tmp/vanity_suffix_confirm.csv`, 3 pairs):
+  - Baseline avg median: `53,979,448`
+  - Candidate avg median: `52,118,468`
+  - Delta: `-1,860,980` (`-3.45%`)
+  - High variance observed across pairs (candidate had both large losses and one large win), so this path is not stable enough to ship.
+- Decision: rejected for now; keep baseline kernel behavior.
