@@ -316,6 +316,18 @@ fn suffix_shift_mod(modulus: u64) -> u64 {
     result
 }
 
+/// Compute 256^8 mod m (used for 8-byte chunked suffix modulus accumulation)
+fn suffix_chunk_mul(modulus: u64) -> u64 {
+    if modulus == 0 {
+        return 0;
+    }
+    let mut result: u64 = 1;
+    for _ in 0..8 {
+        result = ((result as u128 * 256) % modulus as u128) as u64;
+    }
+    result
+}
+
 /// Compute view_pub (as big-endian 32-byte number) mod suffix_modulus
 fn suffix_view_offset(view_pub_bytes: &[u8; 32], modulus: u64) -> u64 {
     if modulus == 0 {
@@ -1407,6 +1419,7 @@ unsafe extern "C" {
         suffix_targets: *const u64,
         num_suffix_targets: i32,
         suffix_shift_mod: u64,
+        suffix_chunk_mul: u64,
         suffix_view_offset: u64,
     ) -> i32;
 
@@ -1642,6 +1655,7 @@ impl SearchBackend for CudaBackend {
 
                     // Upload precomputed ranges to GPU
                     let shift_mod = suffix_shift_mod(suffix_modulus);
+                    let chunk_mul = suffix_chunk_mul(suffix_modulus);
                     let view_offset = suffix_view_offset(&view_pub_bytes, suffix_modulus);
                     let rc = unsafe {
                         cuda_worker_set_ranges(
@@ -1660,6 +1674,7 @@ impl SearchBackend for CudaBackend {
                             },
                             suffix_targets.len() as i32,
                             shift_mod,
+                            chunk_mul,
                             view_offset,
                         )
                     };
@@ -2364,6 +2379,7 @@ mod tests {
                 prefix_ranges.len() as i32,
                 0, // no suffix
                 std::ptr::null(),
+                0,
                 0,
                 0,
                 0,
@@ -3933,6 +3949,7 @@ mod tests {
                 0,
                 0,
                 0,
+                0,
             )
         };
         assert_eq!(rc, 0, "cuda_worker_set_ranges failed");
@@ -4031,6 +4048,7 @@ mod tests {
             assert!(!handle.is_null());
 
             let shift_mod = suffix_shift_mod(suffix_modulus);
+            let chunk_mul = suffix_chunk_mul(suffix_modulus);
             let view_offset = suffix_view_offset(&view_pub_bytes, suffix_modulus);
             let rc = unsafe {
                 cuda_worker_set_ranges(
@@ -4041,6 +4059,7 @@ mod tests {
                     suffix_targets.as_ptr(),
                     suffix_targets.len() as i32,
                     shift_mod,
+                    chunk_mul,
                     view_offset,
                 )
             };

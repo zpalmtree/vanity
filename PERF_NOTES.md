@@ -147,3 +147,43 @@ Earlier short-window snapshots mixed peak and last-sample reporting and were noi
     - Prefix: `+11.80%`, `-3.49%`, `+23.59%`
     - Suffix: `+3.07%`, `+5.67%`, `+18.83%`
 - Decision: accepted.
+
+## 2026-02-16 further CUDA optimization attempts
+
+### Attempt D (rejected): template-specialized kernels for prefix-only / suffix-only / both
+- Idea: compile separate `vanity_kernel` variants with dead paths removed per mode.
+- Result (quick screening, 24s windows):
+  - Prefix regressed (`~62.1M -> ~59.2M` median).
+  - Suffix was near-flat/slight up (`~58.6M -> ~59.0M` median).
+  - ptxas showed much worse prefix-only compile metrics vs generic path (`~496B/532 spills` to `~1184B/1260 spills`).
+- Decision: rejected due register-pressure/spill regression.
+
+### Attempt E (rejected): use constant memory directly for generator table
+- Idea: stop loading `d_gen_table` into shared memory each block; read table from constant memory directly.
+- Result (quick screening, 24s windows):
+  - Prefix regressed (`~80.6M -> ~72.3M` median).
+  - Suffix regressed (`~73.9M -> ~71.1M` median).
+- Decision: rejected.
+
+### Attempt F (accepted): chunked suffix modulus + cached `view_pub` upload
+- Changes:
+  - Suffix path in `vanity_kernel` now accumulates `spend_mod` in 8-byte chunks:
+    - `4` modular steps using precomputed `256^8 mod m` instead of `32` byte-steps.
+  - Added `suffix_chunk_mul` plumbing from Rust setup into CUDA worker state.
+  - Cached worker `view_pub` on host side and only upload to device when it changes (avoids redundant tiny H→D copy each submit).
+- Strict interleaved A/B (`/tmp/vanity_ab_suffix_chunk.csv`):
+  - Baseline: commit `096adb9`
+  - Candidate: chunked suffix + cached `view_pub` upload
+  - Warmup: 12s per variant per mode
+  - Measured window: 24s
+  - Cooldown: 15s
+  - Pairs: 3 per mode
+  - Interleaved order: alternating baseline-first / candidate-first
+  - Fixed settings: `--cuda -t 2 --batch-size 8388608`
+- Aggregate (measured-pair avg medians):
+  - Prefix: `67,522,484 -> 71,980,387` (`+4,457,903`, `+6.60%`)
+  - Suffix: `66,701,708 -> 70,026,123` (`+3,324,415`, `+4.98%`)
+- Pairwise deltas (median, candidate - baseline):
+  - Prefix: `+3.96%`, `+12.33%`, `+3.94%`
+  - Suffix: `+3.73%`, `+2.60%`, `+8.69%`
+- Decision: accepted.
