@@ -9,8 +9,9 @@ use std::time::{Duration, Instant};
 use std::ffi::CString;
 
 use clap::Parser;
-use curve25519_dalek::constants::{RISTRETTO_BASEPOINT_POINT, RISTRETTO_BASEPOINT_TABLE};
-#[cfg(any(feature = "cuda", test))]
+#[cfg(any(test, all(feature = "cuda", target_os = "linux")))]
+use curve25519_dalek::constants::RISTRETTO_BASEPOINT_POINT;
+use curve25519_dalek::constants::RISTRETTO_BASEPOINT_TABLE;
 use curve25519_dalek::ristretto::RistrettoPoint;
 use curve25519_dalek::scalar::Scalar;
 use rand::RngCore;
@@ -44,6 +45,10 @@ struct Args {
     /// GPU batch size (keys per kernel launch) [default: 8388608]
     #[arg(long, default_value = "8388608")]
     batch_size: usize,
+
+    /// Exit after N seconds (for benchmarking)
+    #[arg(long)]
+    duration: Option<u64>,
 }
 
 #[derive(Serialize, Clone)]
@@ -377,6 +382,580 @@ fn prefix_match_ranges_split(
     false
 }
 
+// ============================================================================
+// Custom Ristretto compressor — eliminates curve25519-dalek abstraction overhead
+// Field arithmetic: radix-2^51, 5×u64 limbs (matching dalek's FieldElement51)
+// ============================================================================
+
+#[inline(always)]
+fn fe_add(f: &[u64; 5], g: &[u64; 5]) -> [u64; 5] {
+    [
+        f[0] + g[0],
+        f[1] + g[1],
+        f[2] + g[2],
+        f[3] + g[3],
+        f[4] + g[4],
+    ]
+}
+
+#[inline(always)]
+fn fe_sub(f: &[u64; 5], g: &[u64; 5]) -> [u64; 5] {
+    let mask: u64 = (1u64 << 51) - 1;
+    [
+        (f[0] + 2 * ((1u64 << 51) - 19)) - g[0],
+        (f[1] + 2 * mask) - g[1],
+        (f[2] + 2 * mask) - g[2],
+        (f[3] + 2 * mask) - g[3],
+        (f[4] + 2 * mask) - g[4],
+    ]
+}
+
+#[inline(always)]
+fn fe_mul(f: &[u64; 5], g: &[u64; 5]) -> [u64; 5] {
+    let (f0, f1, f2, f3, f4) = (f[0], f[1], f[2], f[3], f[4]);
+    let (g0, g1, g2, g3, g4) = (g[0], g[1], g[2], g[3], g[4]);
+    let (g1_19, g2_19, g3_19, g4_19) = (g1 * 19, g2 * 19, g3 * 19, g4 * 19);
+    let h0: u128 = f0 as u128 * g0 as u128
+        + f1 as u128 * g4_19 as u128
+        + f2 as u128 * g3_19 as u128
+        + f3 as u128 * g2_19 as u128
+        + f4 as u128 * g1_19 as u128;
+    let h1: u128 = f0 as u128 * g1 as u128
+        + f1 as u128 * g0 as u128
+        + f2 as u128 * g4_19 as u128
+        + f3 as u128 * g3_19 as u128
+        + f4 as u128 * g2_19 as u128;
+    let h2: u128 = f0 as u128 * g2 as u128
+        + f1 as u128 * g1 as u128
+        + f2 as u128 * g0 as u128
+        + f3 as u128 * g4_19 as u128
+        + f4 as u128 * g3_19 as u128;
+    let h3: u128 = f0 as u128 * g3 as u128
+        + f1 as u128 * g2 as u128
+        + f2 as u128 * g1 as u128
+        + f3 as u128 * g0 as u128
+        + f4 as u128 * g4_19 as u128;
+    let h4: u128 = f0 as u128 * g4 as u128
+        + f1 as u128 * g3 as u128
+        + f2 as u128 * g2 as u128
+        + f3 as u128 * g1 as u128
+        + f4 as u128 * g0 as u128;
+    let mask: u64 = (1u64 << 51) - 1;
+    let c = (h0 >> 51) as u64;
+    let v0 = h0 as u64 & mask;
+    let h1 = h1 + c as u128;
+    let c = (h1 >> 51) as u64;
+    let v1 = h1 as u64 & mask;
+    let h2 = h2 + c as u128;
+    let c = (h2 >> 51) as u64;
+    let v2 = h2 as u64 & mask;
+    let h3 = h3 + c as u128;
+    let c = (h3 >> 51) as u64;
+    let v3 = h3 as u64 & mask;
+    let h4 = h4 + c as u128;
+    let c = (h4 >> 51) as u64;
+    let v4 = h4 as u64 & mask;
+    let mut r = [v0 + c * 19, v1, v2, v3, v4];
+    let c2 = r[0] >> 51;
+    r[0] &= mask;
+    r[1] += c2;
+    r
+}
+
+#[inline(always)]
+fn fe_sq(f: &[u64; 5]) -> [u64; 5] {
+    let (f0, f1, f2, f3, f4) = (f[0], f[1], f[2], f[3], f[4]);
+    let f0_2 = f0 * 2;
+    let f1_2 = f1 * 2;
+    let h0: u128 = f0 as u128 * f0 as u128
+        + (f1 * 38) as u128 * f4 as u128
+        + (f2 * 38) as u128 * f3 as u128;
+    let h1: u128 = f0_2 as u128 * f1 as u128
+        + (f2 * 38) as u128 * f4 as u128
+        + (f3 * 19) as u128 * f3 as u128;
+    let h2: u128 = f0_2 as u128 * f2 as u128
+        + f1 as u128 * f1 as u128
+        + (f3 * 38) as u128 * f4 as u128;
+    let h3: u128 = f0_2 as u128 * f3 as u128
+        + f1_2 as u128 * f2 as u128
+        + (f4 * 19) as u128 * f4 as u128;
+    let h4: u128 =
+        f0_2 as u128 * f4 as u128 + f1_2 as u128 * f3 as u128 + f2 as u128 * f2 as u128;
+    let mask: u64 = (1u64 << 51) - 1;
+    let c = (h0 >> 51) as u64;
+    let v0 = h0 as u64 & mask;
+    let h1 = h1 + c as u128;
+    let c = (h1 >> 51) as u64;
+    let v1 = h1 as u64 & mask;
+    let h2 = h2 + c as u128;
+    let c = (h2 >> 51) as u64;
+    let v2 = h2 as u64 & mask;
+    let h3 = h3 + c as u128;
+    let c = (h3 >> 51) as u64;
+    let v3 = h3 as u64 & mask;
+    let h4 = h4 + c as u128;
+    let c = (h4 >> 51) as u64;
+    let v4 = h4 as u64 & mask;
+    let mut r = [v0 + c * 19, v1, v2, v3, v4];
+    let c2 = r[0] >> 51;
+    r[0] &= mask;
+    r[1] += c2;
+    r
+}
+
+#[inline(always)]
+fn fe_tobytes(v: &[u64; 5]) -> [u8; 32] {
+    let mut h = *v;
+    let mask: u64 = (1u64 << 51) - 1;
+    let mut c: u64;
+    c = h[0] >> 51;
+    h[0] &= mask;
+    h[1] += c;
+    c = h[1] >> 51;
+    h[1] &= mask;
+    h[2] += c;
+    c = h[2] >> 51;
+    h[2] &= mask;
+    h[3] += c;
+    c = h[3] >> 51;
+    h[3] &= mask;
+    h[4] += c;
+    c = h[4] >> 51;
+    h[4] &= mask;
+    h[0] += c * 19;
+    c = h[0] >> 51;
+    h[0] &= mask;
+    h[1] += c;
+    let mut q = (h[0] + 19) >> 51;
+    q = (h[1] + q) >> 51;
+    q = (h[2] + q) >> 51;
+    q = (h[3] + q) >> 51;
+    q = (h[4] + q) >> 51;
+    h[0] += q * 19;
+    c = h[0] >> 51;
+    h[0] &= mask;
+    h[1] += c;
+    c = h[1] >> 51;
+    h[1] &= mask;
+    h[2] += c;
+    c = h[2] >> 51;
+    h[2] &= mask;
+    h[3] += c;
+    c = h[3] >> 51;
+    h[3] &= mask;
+    h[4] += c;
+    h[4] &= mask;
+    let lo0 = h[0] | (h[1] << 51);
+    let lo1 = (h[1] >> 13) | (h[2] << 38);
+    let lo2 = (h[2] >> 26) | (h[3] << 25);
+    let lo3 = (h[3] >> 39) | (h[4] << 12);
+    let mut out = [0u8; 32];
+    out[0..8].copy_from_slice(&lo0.to_le_bytes());
+    out[8..16].copy_from_slice(&lo1.to_le_bytes());
+    out[16..24].copy_from_slice(&lo2.to_le_bytes());
+    out[24..32].copy_from_slice(&lo3.to_le_bytes());
+    out
+}
+
+/// Fast negation check: reduce limb 0 and check bit 0 (skip full tobytes packing)
+#[inline(always)]
+fn fe_isneg_fast(f: &[u64; 5]) -> bool {
+    // We need the fully reduced value's bit 0.
+    // Partial reduce: carry chain to normalize limbs, then check limb 0 bit 0.
+    let mask: u64 = (1u64 << 51) - 1;
+    let mut h = *f;
+    let mut c: u64;
+    c = h[0] >> 51;
+    h[0] &= mask;
+    h[1] += c;
+    c = h[1] >> 51;
+    h[1] &= mask;
+    h[2] += c;
+    c = h[2] >> 51;
+    h[2] &= mask;
+    h[3] += c;
+    c = h[3] >> 51;
+    h[3] &= mask;
+    h[4] += c;
+    c = h[4] >> 51;
+    h[4] &= mask;
+    h[0] += c * 19;
+    c = h[0] >> 51;
+    h[0] &= mask;
+    h[1] += c;
+    // Final reduction: check if >= p and conditionally subtract
+    let mut q = (h[0] + 19) >> 51;
+    q = (h[1] + q) >> 51;
+    q = (h[2] + q) >> 51;
+    q = (h[3] + q) >> 51;
+    q = (h[4] + q) >> 51;
+    h[0] += q * 19;
+    h[0] &= mask;
+    h[0] & 1 == 1
+}
+
+/// Fast equality check: subtract, fully reduce, OR all limbs (skip 2x tobytes + memcmp)
+#[allow(dead_code)]
+#[inline(always)]
+fn fe_equal_fast(f: &[u64; 5], g: &[u64; 5]) -> bool {
+    let diff = fe_sub(f, g);
+    let mask: u64 = (1u64 << 51) - 1;
+    let mut h = diff;
+    let mut c: u64;
+    // First carry chain
+    c = h[0] >> 51;
+    h[0] &= mask;
+    h[1] += c;
+    c = h[1] >> 51;
+    h[1] &= mask;
+    h[2] += c;
+    c = h[2] >> 51;
+    h[2] &= mask;
+    h[3] += c;
+    c = h[3] >> 51;
+    h[3] &= mask;
+    h[4] += c;
+    c = h[4] >> 51;
+    h[4] &= mask;
+    h[0] += c * 19;
+    c = h[0] >> 51;
+    h[0] &= mask;
+    h[1] += c;
+    // Conditional subtraction of p
+    let mut q = (h[0] + 19) >> 51;
+    q = (h[1] + q) >> 51;
+    q = (h[2] + q) >> 51;
+    q = (h[3] + q) >> 51;
+    q = (h[4] + q) >> 51;
+    h[0] += q * 19;
+    // Propagate carries after q*19 addition
+    c = h[0] >> 51;
+    h[0] &= mask;
+    h[1] += c;
+    c = h[1] >> 51;
+    h[1] &= mask;
+    h[2] += c;
+    c = h[2] >> 51;
+    h[2] &= mask;
+    h[3] += c;
+    c = h[3] >> 51;
+    h[3] &= mask;
+    h[4] += c;
+    h[4] &= mask;
+    // If all limbs are zero, values are equal
+    (h[0] | h[1] | h[2] | h[3] | h[4]) == 0
+}
+
+#[inline(always)]
+fn fe_neg(f: &[u64; 5]) -> [u64; 5] {
+    fe_sub(&[0; 5], f)
+}
+
+#[inline(always)]
+fn fe_abs(f: &[u64; 5]) -> [u64; 5] {
+    if fe_isneg_fast(f) {
+        fe_neg(f)
+    } else {
+        *f
+    }
+}
+
+#[inline(always)]
+fn fe_sq_n(f: &[u64; 5], n: usize) -> [u64; 5] {
+    let mut h = fe_sq(f);
+    for _ in 1..n {
+        h = fe_sq(&h);
+    }
+    h
+}
+
+/// f^(2^252-3) exponentiation chain (~252 squarings + 11 multiplications)
+#[inline(never)]
+fn fe_pow22523(f: &[u64; 5]) -> [u64; 5] {
+    let mut t0 = fe_sq(f);
+    let mut t1 = fe_sq_n(&t0, 2);
+    t1 = fe_mul(f, &t1);
+    t0 = fe_mul(&t0, &t1);
+    t0 = fe_sq(&t0);
+    t0 = fe_mul(&t1, &t0);
+    t1 = fe_sq_n(&t0, 5);
+    t0 = fe_mul(&t1, &t0);
+    t1 = fe_sq_n(&t0, 10);
+    t1 = fe_mul(&t1, &t0);
+    let mut t2 = fe_sq_n(&t1, 20);
+    t1 = fe_mul(&t2, &t1);
+    t1 = fe_sq_n(&t1, 10);
+    t0 = fe_mul(&t1, &t0);
+    t1 = fe_sq_n(&t0, 50);
+    t1 = fe_mul(&t1, &t0);
+    t2 = fe_sq_n(&t1, 100);
+    t1 = fe_mul(&t2, &t1);
+    t1 = fe_sq_n(&t1, 50);
+    t0 = fe_mul(&t1, &t0);
+    t0 = fe_sq_n(&t0, 2);
+    fe_mul(&t0, f)
+}
+
+const SQRT_M1: [u64; 5] = [
+    1718705420411056,
+    234908883556509,
+    2233514472574048,
+    2117202627021982,
+    765476049583133,
+];
+
+const INVSQRT_A_MINUS_D: [u64; 5] = [
+    278908739862762,
+    821645201101625,
+    8113234426968,
+    1777959178193151,
+    2118520810568447,
+];
+
+// Precomputed byte representations for sqrt_ratio check comparisons
+// (avoids 3x fe_equal_fast — one fe_tobytes + 3 byte comparisons instead)
+const ONE_BYTES: [u8; 32] = [
+    1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+    0, 0,
+];
+const NEG_ONE_BYTES: [u8; 32] = [
+    236, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255,
+    255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 127,
+];
+const NEG_SQRT_M1_BYTES: [u8; 32] = [
+    61, 95, 241, 181, 216, 228, 17, 59, 135, 27, 208, 82, 249, 231, 188, 208, 88, 40, 4, 194,
+    102, 255, 178, 212, 244, 32, 62, 176, 127, 219, 124, 84,
+];
+
+/// Custom Ristretto point compression — bypasses curve25519-dalek abstractions.
+/// Extracts internal [X,Y,Z,T] coordinates via pointer cast and runs the
+/// encoding algorithm directly with our field arithmetic.
+#[cfg(test)]
+#[inline(always)]
+fn ristretto_compress(point: &RistrettoPoint) -> [u8; 32] {
+    let coords = extract_point_coords(point);
+    let x = [coords[0], coords[1], coords[2], coords[3], coords[4]];
+    let y = [coords[5], coords[6], coords[7], coords[8], coords[9]];
+    let z = [coords[10], coords[11], coords[12], coords[13], coords[14]];
+    let t = [coords[15], coords[16], coords[17], coords[18], coords[19]];
+
+    // u1 = (Z+Y)*(Z-Y)
+    let t0 = fe_add(&z, &y);
+    let t1 = fe_sub(&z, &y);
+    let u1 = fe_mul(&t0, &t1);
+
+    // u2 = X*Y
+    let u2 = fe_mul(&x, &y);
+
+    // sqrt_ratio_m1(u=1, v=u1*u2^2)
+    let u2_sq = fe_sq(&u2);
+    let v = fe_mul(&u1, &u2_sq);
+    let v_sq = fe_sq(&v);
+    let v3 = fe_mul(&v_sq, &v);
+    let v3_sq = fe_sq(&v3);
+    let v7 = fe_mul(&v3_sq, &v);
+    let pow = fe_pow22523(&v7); // v7^((p-5)/8)
+    let mut r = fe_mul(&pow, &v3); // r = v3 * v7^((p-5)/8)
+
+    let r_sq = fe_sq(&r);
+    let check = fe_mul(&v, &r_sq);
+    let check_bytes = fe_tobytes(&check);
+    let correct_sign = check_bytes == ONE_BYTES;
+    let flipped_sign = check_bytes == NEG_ONE_BYTES;
+    let flipped_sign_i = check_bytes == NEG_SQRT_M1_BYTES;
+
+    let r_prime = fe_mul(&r, &SQRT_M1);
+    if flipped_sign || flipped_sign_i {
+        r = r_prime;
+    }
+    let inv = fe_abs(&r);
+    let _was_sq = correct_sign || flipped_sign;
+
+    // den1 = inv * u1, den2 = inv * u2
+    let den1 = fe_mul(&inv, &u1);
+    let den2 = fe_mul(&inv, &u2);
+
+    // z_inv = den1 * den2 * T
+    let z_inv = fe_mul(&fe_mul(&den1, &den2), &t);
+
+    // ix0 = X * SQRT_M1, iy0 = Y * SQRT_M1
+    let ix0 = fe_mul(&x, &SQRT_M1);
+    let iy0 = fe_mul(&y, &SQRT_M1);
+
+    // ench_den = den1 * INVSQRT_A_MINUS_D
+    let ench_den = fe_mul(&den1, &INVSQRT_A_MINUS_D);
+
+    // rotate = isneg(T * z_inv)
+    let t_zinv = fe_mul(&t, &z_inv);
+    let rotate = fe_isneg_fast(&t_zinv);
+
+    // conditional rotation
+    let (x_r, y_r, den_inv) = if rotate {
+        (iy0, ix0, ench_den)
+    } else {
+        (x, y, den2)
+    };
+
+    // neg_y = isneg(x * z_inv)
+    let x_zinv = fe_mul(&x_r, &z_inv);
+    let neg_y = fe_isneg_fast(&x_zinv);
+
+    let y_final = if neg_y { fe_neg(&y_r) } else { y_r };
+
+    // s = |den_inv * (Z - y_final)|
+    let z_minus_y = fe_sub(&z, &y_final);
+    let s = fe_mul(&den_inv, &z_minus_y);
+    let s_final = fe_abs(&s);
+
+    fe_tobytes(&s_final)
+}
+
+/// Ristretto compression directly from radix-2^51 extended Edwards coordinates.
+/// Avoids extract_point_coords overhead when we maintain our own point representation.
+#[inline(always)]
+fn ristretto_compress_limbs(point: &[[u64; 5]; 4]) -> [u8; 32] {
+    let x = point[0];
+    let y = point[1];
+    let z = point[2];
+    let t = point[3];
+
+    // u1 = (Z+Y)*(Z-Y)
+    let t0 = fe_add(&z, &y);
+    let t1 = fe_sub(&z, &y);
+    let u1 = fe_mul(&t0, &t1);
+
+    // u2 = X*Y
+    let u2 = fe_mul(&x, &y);
+
+    // sqrt_ratio_m1(u=1, v=u1*u2^2)
+    let u2_sq = fe_sq(&u2);
+    let v = fe_mul(&u1, &u2_sq);
+    let v_sq = fe_sq(&v);
+    let v3 = fe_mul(&v_sq, &v);
+    let v3_sq = fe_sq(&v3);
+    let v7 = fe_mul(&v3_sq, &v);
+    let pow = fe_pow22523(&v7);
+    let mut r = fe_mul(&pow, &v3);
+
+    let r_sq = fe_sq(&r);
+    let check = fe_mul(&v, &r_sq);
+    let check_bytes = fe_tobytes(&check);
+    let correct_sign = check_bytes == ONE_BYTES;
+    let flipped_sign = check_bytes == NEG_ONE_BYTES;
+    let flipped_sign_i = check_bytes == NEG_SQRT_M1_BYTES;
+
+    let r_prime = fe_mul(&r, &SQRT_M1);
+    if flipped_sign || flipped_sign_i {
+        r = r_prime;
+    }
+    let inv = fe_abs(&r);
+    let _was_sq = correct_sign || flipped_sign;
+
+    let den1 = fe_mul(&inv, &u1);
+    let den2 = fe_mul(&inv, &u2);
+    let z_inv = fe_mul(&fe_mul(&den1, &den2), &t);
+    let ix0 = fe_mul(&x, &SQRT_M1);
+    let iy0 = fe_mul(&y, &SQRT_M1);
+    let ench_den = fe_mul(&den1, &INVSQRT_A_MINUS_D);
+    let t_zinv = fe_mul(&t, &z_inv);
+    let rotate = fe_isneg_fast(&t_zinv);
+
+    let (x_r, y_r, den_inv) = if rotate {
+        (iy0, ix0, ench_den)
+    } else {
+        (x, y, den2)
+    };
+
+    let x_zinv = fe_mul(&x_r, &z_inv);
+    let neg_y = fe_isneg_fast(&x_zinv);
+    let y_final = if neg_y { fe_neg(&y_r) } else { y_r };
+
+    let z_minus_y = fe_sub(&z, &y_final);
+    let s = fe_mul(&den_inv, &z_minus_y);
+    let s_final = fe_abs(&s);
+    fe_tobytes(&s_final)
+}
+
+// ============================================================================
+// Custom mixed Edwards point addition (Hisil et al. 2008)
+// Second point is affine (Z=1), precomputed as (Y-X, Y+X, 2*d*T)
+// Cost: 7 fe_mul + 1 fe_sq (vs ~9 mul through dalek's fiat-crypto)
+// ============================================================================
+
+/// Precomputed basepoint G in Niels-like form for mixed addition: (Y-X, Y+X, 2*d*T)
+const G_Y_MINUS_X: [u64; 5] = [
+    62697248952638,
+    204681361388450,
+    631292143396476,
+    338455783676468,
+    1213667448819585,
+];
+const G_Y_PLUS_X: [u64; 5] = [
+    1288382639258501,
+    245678601348599,
+    269427782077623,
+    1462984067271730,
+    137412439391563,
+];
+const G_TWO_D_T: [u64; 5] = [
+    301289933810280,
+    1259582250014073,
+    1422107436869536,
+    796239922652654,
+    1953934009299142,
+];
+
+/// Mixed Edwards point addition: P + Q where Q is affine (Z=1).
+/// Q is precomputed as (Y-X, Y+X, 2*d*T).
+/// Returns P + Q in extended coordinates [X3, Y3, Z3, T3].
+///
+/// Formula (Hisil et al. 2008, Table 2, "madd"):
+///   A = (Y1-X1) * (Y2-X2)     [precomputed Y2-X2]
+///   B = (Y1+X1) * (Y2+X2)     [precomputed Y2+X2]
+///   C = T1 * (2*d*T2)          [precomputed 2*d*T2]
+///   D = Z1 + Z1                [no multiply needed]
+///   E = B - A
+///   F = D - C
+///   G = D + C
+///   H = B + A
+///   X3 = E * F
+///   Y3 = G * H
+///   T3 = E * H
+///   Z3 = F * G
+#[inline(always)]
+fn edwards_add_mixed(
+    p: &[[u64; 5]; 4],
+    q_y_minus_x: &[u64; 5],
+    q_y_plus_x: &[u64; 5],
+    q_two_d_t: &[u64; 5],
+) -> [[u64; 5]; 4] {
+    let y1_minus_x1 = fe_sub(&p[1], &p[0]);
+    let y1_plus_x1 = fe_add(&p[1], &p[0]);
+
+    let a = fe_mul(&y1_minus_x1, q_y_minus_x);
+    let b = fe_mul(&y1_plus_x1, q_y_plus_x);
+    let c = fe_mul(&p[3], q_two_d_t);
+    let d = fe_add(&p[2], &p[2]); // D = 2*Z1
+
+    let e = fe_sub(&b, &a);
+    let f = fe_sub(&d, &c);
+    let g = fe_add(&d, &c);
+    let h = fe_add(&b, &a);
+
+    let x3 = fe_mul(&e, &f);
+    let y3 = fe_mul(&g, &h);
+    let t3 = fe_mul(&e, &h);
+    let z3 = fe_mul(&f, &g);
+
+    [x3, y3, z3, t3]
+}
+
+/// Add the basepoint G to a point in extended coordinates.
+#[inline(always)]
+fn edwards_add_basepoint(p: &[[u64; 5]; 4]) -> [[u64; 5]; 4] {
+    edwards_add_mixed(p, &G_Y_MINUS_X, &G_Y_PLUS_X, &G_TWO_D_T)
+}
+
 trait SearchBackend: Send {
     fn name(&self) -> &'static str;
     fn start(
@@ -432,8 +1011,16 @@ impl SearchBackend for CpuBackend {
                 let view_pub_bytes = view_pub.to_bytes();
 
                 // Random starting point, then increment (avoids RNG overhead in hot loop)
-                let mut spend_priv = random_scalar(&mut rng);
-                let mut spend_pub_point = &spend_priv * RISTRETTO_BASEPOINT_TABLE;
+                let base_spend_priv = random_scalar(&mut rng);
+                let start_point = &base_spend_priv * RISTRETTO_BASEPOINT_TABLE;
+                // Extract into our own limb representation for custom mixed addition
+                let coords = extract_point_coords(&start_point);
+                let mut point_limbs: [[u64; 5]; 4] = [
+                    [coords[0], coords[1], coords[2], coords[3], coords[4]],
+                    [coords[5], coords[6], coords[7], coords[8], coords[9]],
+                    [coords[10], coords[11], coords[12], coords[13], coords[14]],
+                    [coords[15], coords[16], coords[17], coords[18], coords[19]],
+                ];
                 let mut local_count: u64 = 0;
                 let mut combined = [0u8; 64];
                 let mut address_bytes = [0u8; 96];
@@ -441,8 +1028,8 @@ impl SearchBackend for CpuBackend {
                 let suffix_view_mod = suffix_view_offset(&view_pub_bytes, suffix_modulus);
 
                 loop {
-                    let spend_pub = spend_pub_point.compress();
-                    let spend_pub_bytes = spend_pub.as_bytes();
+                    let spend_pub_bytes = ristretto_compress_limbs(&point_limbs);
+                    let spend_pub_bytes = &spend_pub_bytes;
                     let mut matched_address: Option<String> = None;
 
                     if use_legacy_base58_matcher {
@@ -490,6 +1077,8 @@ impl SearchBackend for CpuBackend {
                     }
 
                     if let Some(address) = matched_address {
+                        // Derive scalar only on match (deferred from hot path)
+                        let spend_priv = base_spend_priv + Scalar::from(local_count);
                         let wallet = VanityWallet {
                             address,
                             spend_private_key: hex::encode(spend_priv.as_bytes()),
@@ -503,8 +1092,7 @@ impl SearchBackend for CpuBackend {
                         }
                     }
 
-                    spend_priv += Scalar::ONE;
-                    spend_pub_point += RISTRETTO_BASEPOINT_POINT;
+                    point_limbs = edwards_add_basepoint(&point_limbs);
                     local_count += 1;
                     if local_count & 0x3FF == 0 {
                         counter.fetch_add(1024, Ordering::Relaxed);
@@ -596,7 +1184,6 @@ unsafe extern "C" {
 /// SAFETY: This depends on the internal memory layout of curve25519-dalek v4.
 /// RistrettoPoint -> EdwardsPoint -> { X: FieldElement51, Y: .., Z: .., T: .. }
 /// FieldElement51 = [u64; 5]
-#[cfg(all(feature = "cuda", target_os = "linux"))]
 fn extract_point_coords(point: &RistrettoPoint) -> [u64; 20] {
     // Verify our assumption about the struct size
     assert_eq!(
@@ -1082,9 +1669,33 @@ fn main() {
             // Two submit threads tend to outperform four on desktop GPUs that also drive displays.
             2
         } else {
-            thread::available_parallelism()
-                .map(|n| n.get())
-                .unwrap_or(4)
+            // On macOS with P/E cores, default to P-core count only.
+            // E-cores are ~2-3x slower and can cause thermal throttling.
+            #[cfg(target_os = "macos")]
+            {
+                std::process::Command::new("sysctl")
+                    .args(["-n", "hw.perflevel0.logicalcpu"])
+                    .output()
+                    .ok()
+                    .and_then(|out| {
+                        std::str::from_utf8(&out.stdout)
+                            .ok()?
+                            .trim()
+                            .parse::<usize>()
+                            .ok()
+                    })
+                    .unwrap_or_else(|| {
+                        thread::available_parallelism()
+                            .map(|n| n.get())
+                            .unwrap_or(4)
+                    })
+            }
+            #[cfg(not(target_os = "macos"))]
+            {
+                thread::available_parallelism()
+                    .map(|n| n.get())
+                    .unwrap_or(4)
+            }
         }
     });
 
@@ -1147,6 +1758,7 @@ fn main() {
     }
 
     // Status display on main thread
+    let duration_limit = args.duration.map(Duration::from_secs);
     let stderr = io::stderr();
     loop {
         thread::sleep(Duration::from_millis(500));
@@ -1172,6 +1784,14 @@ fn main() {
             format_duration(estimate),
         );
         let _ = handle.flush();
+
+        if let Some(limit) = duration_limit {
+            if elapsed >= limit {
+                drop(handle);
+                eprintln!("\n  duration limit reached ({:.0}s), exiting", secs);
+                std::process::exit(0);
+            }
+        }
     }
 }
 
@@ -2660,6 +3280,82 @@ mod tests {
             *dalek_compressed.as_bytes(),
             "CPU ristretto encode doesn't match dalek"
         );
+    }
+
+    #[test]
+    fn test_custom_compressor_matches_dalek_1000_points() {
+        let mut rng = rand::thread_rng();
+        for i in 0..1000 {
+            let scalar = random_scalar(&mut rng);
+            let point = &scalar * RISTRETTO_BASEPOINT_TABLE;
+            let custom = ristretto_compress(&point);
+            let dalek = point.compress();
+            assert_eq!(
+                custom,
+                *dalek.as_bytes(),
+                "custom compressor mismatch at iteration {}",
+                i
+            );
+        }
+    }
+
+    #[test]
+    fn test_edwards_add_mixed_matches_dalek_1000_points() {
+        // Start from a random point, add G repeatedly using our custom mixed addition,
+        // and verify each result matches dalek's addition.
+        let mut rng = rand::thread_rng();
+        let start_scalar = random_scalar(&mut rng);
+        let start_point = &start_scalar * RISTRETTO_BASEPOINT_TABLE;
+        let coords = extract_point_coords(&start_point);
+        let mut point_limbs: [[u64; 5]; 4] = [
+            [coords[0], coords[1], coords[2], coords[3], coords[4]],
+            [coords[5], coords[6], coords[7], coords[8], coords[9]],
+            [coords[10], coords[11], coords[12], coords[13], coords[14]],
+            [coords[15], coords[16], coords[17], coords[18], coords[19]],
+        ];
+
+        let mut dalek_point = start_point;
+
+        for i in 0..1000 {
+            // Compare compression output (which verifies the point coordinates are equivalent)
+            let custom_compressed = ristretto_compress_limbs(&point_limbs);
+            let dalek_compressed = dalek_point.compress();
+            assert_eq!(
+                custom_compressed,
+                *dalek_compressed.as_bytes(),
+                "mixed addition diverged at step {}",
+                i
+            );
+
+            // Advance both representations
+            point_limbs = edwards_add_basepoint(&point_limbs);
+            dalek_point += RISTRETTO_BASEPOINT_POINT;
+        }
+    }
+
+    #[test]
+    fn test_ristretto_compress_limbs_matches_dalek_1000_points() {
+        // Verify ristretto_compress_limbs produces the same output as dalek for random points
+        let mut rng = rand::thread_rng();
+        for i in 0..1000 {
+            let scalar = random_scalar(&mut rng);
+            let point = &scalar * RISTRETTO_BASEPOINT_TABLE;
+            let coords = extract_point_coords(&point);
+            let limbs: [[u64; 5]; 4] = [
+                [coords[0], coords[1], coords[2], coords[3], coords[4]],
+                [coords[5], coords[6], coords[7], coords[8], coords[9]],
+                [coords[10], coords[11], coords[12], coords[13], coords[14]],
+                [coords[15], coords[16], coords[17], coords[18], coords[19]],
+            ];
+            let custom = ristretto_compress_limbs(&limbs);
+            let dalek = point.compress();
+            assert_eq!(
+                custom,
+                *dalek.as_bytes(),
+                "ristretto_compress_limbs mismatch at iteration {}",
+                i
+            );
+        }
     }
 
     // ========================================================================
