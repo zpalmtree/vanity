@@ -660,6 +660,7 @@ fn fe_abs(f: &[u64; 5]) -> [u64; 5] {
     }
 }
 
+#[cfg(test)]
 #[inline(always)]
 fn fe_sq_n(f: &[u64; 5], n: usize) -> [u64; 5] {
     let mut h = fe_sq(f);
@@ -670,6 +671,7 @@ fn fe_sq_n(f: &[u64; 5], n: usize) -> [u64; 5] {
 }
 
 /// f^(2^252-3) exponentiation chain (~252 squarings + 11 multiplications)
+#[cfg(test)]
 #[inline(never)]
 fn fe_pow22523(f: &[u64; 5]) -> [u64; 5] {
     let mut t0 = fe_sq(f);
@@ -812,6 +814,7 @@ fn ristretto_compress(point: &RistrettoPoint) -> [u8; 32] {
 
 /// Ristretto compression directly from radix-2^51 extended Edwards coordinates.
 /// Avoids extract_point_coords overhead when we maintain our own point representation.
+#[cfg(test)]
 #[inline(always)]
 fn ristretto_compress_limbs(point: &[[u64; 5]; 4]) -> [u8; 32] {
     let x = point[0];
@@ -874,6 +877,208 @@ fn ristretto_compress_limbs(point: &[[u64; 5]; 4]) -> [u8; 32] {
     let s = fe_mul(&den_inv, &z_minus_y);
     let s_final = fe_abs(&s);
     fe_tobytes(&s_final)
+}
+
+// ============================================================================
+// Split Ristretto compression for interleaved dual-key processing
+// ============================================================================
+
+/// Intermediate state between compress_pre and compress_post, holding values
+/// needed after the expensive fe_pow22523 call.
+struct CompressIntermediate {
+    v3: [u64; 5],
+    v: [u64; 5],
+    u1: [u64; 5],
+    u2: [u64; 5],
+    x: [u64; 5],
+    y: [u64; 5],
+    z: [u64; 5],
+    t: [u64; 5],
+}
+
+/// Pre-phase of Ristretto compression: compute up to the fe_pow22523 input.
+/// Returns (intermediate state, v7) where v7 is the input to fe_pow22523.
+#[inline(always)]
+fn compress_pre(point: &[[u64; 5]; 4]) -> (CompressIntermediate, [u64; 5]) {
+    let x = point[0];
+    let y = point[1];
+    let z = point[2];
+    let t = point[3];
+
+    // u1 = (Z+Y)*(Z-Y)
+    let t0 = fe_add(&z, &y);
+    let t1 = fe_sub(&z, &y);
+    let u1 = fe_mul(&t0, &t1);
+
+    // u2 = X*Y
+    let u2 = fe_mul(&x, &y);
+
+    // sqrt_ratio_m1(u=1, v=u1*u2^2)
+    let u2_sq = fe_sq(&u2);
+    let v = fe_mul(&u1, &u2_sq);
+    let v_sq = fe_sq(&v);
+    let v3 = fe_mul(&v_sq, &v);
+    let v3_sq = fe_sq(&v3);
+    let v7 = fe_mul(&v3_sq, &v);
+
+    (CompressIntermediate { v3, v, u1, u2, x, y, z, t }, v7)
+}
+
+/// Post-phase of Ristretto compression: given the fe_pow22523 result, finish encoding.
+#[inline(always)]
+fn compress_post(inter: &CompressIntermediate, pow: &[u64; 5]) -> [u8; 32] {
+    let mut r = fe_mul(pow, &inter.v3); // r = v3 * v7^((p-5)/8)
+
+    let r_sq = fe_sq(&r);
+    let check = fe_mul(&inter.v, &r_sq);
+    let check_bytes = fe_tobytes(&check);
+    let _correct_sign = check_bytes == ONE_BYTES;
+    let flipped_sign = check_bytes == NEG_ONE_BYTES;
+    let flipped_sign_i = check_bytes == NEG_SQRT_M1_BYTES;
+
+    let r_prime = fe_mul(&r, &SQRT_M1);
+    if flipped_sign || flipped_sign_i {
+        r = r_prime;
+    }
+    let inv = fe_abs(&r);
+
+    let den1 = fe_mul(&inv, &inter.u1);
+    let den2 = fe_mul(&inv, &inter.u2);
+    let z_inv = fe_mul(&fe_mul(&den1, &den2), &inter.t);
+    let ix0 = fe_mul(&inter.x, &SQRT_M1);
+    let iy0 = fe_mul(&inter.y, &SQRT_M1);
+    let ench_den = fe_mul(&den1, &INVSQRT_A_MINUS_D);
+    let t_zinv = fe_mul(&inter.t, &z_inv);
+    let rotate = fe_isneg_fast(&t_zinv);
+
+    let (x_r, y_r, den_inv) = if rotate {
+        (iy0, ix0, ench_den)
+    } else {
+        (inter.x, inter.y, den2)
+    };
+
+    let x_zinv = fe_mul(&x_r, &z_inv);
+    let neg_y = fe_isneg_fast(&x_zinv);
+    let y_final = if neg_y { fe_neg(&y_r) } else { y_r };
+
+    let z_minus_y = fe_sub(&inter.z, &y_final);
+    let s = fe_mul(&den_inv, &z_minus_y);
+    let s_final = fe_abs(&s);
+    fe_tobytes(&s_final)
+}
+
+// ============================================================================
+// Interleaved dual fe_pow22523 — fills idle multiply units on Apple Silicon
+// ============================================================================
+
+/// Compute fe_pow22523 for two independent inputs simultaneously.
+/// LLVM interleaves the two independent chains, keeping both multiply units busy.
+#[inline(never)]
+fn fe_pow22523_x2(f: &[u64; 5], g: &[u64; 5]) -> ([u64; 5], [u64; 5]) {
+    // Step 1: t0 = sq(input)
+    let mut f_t0 = fe_sq(f);
+    let mut g_t0 = fe_sq(g);
+
+    // Step 2: t1 = sq_n(t0, 2)
+    let mut f_t1 = fe_sq(&f_t0);
+    let mut g_t1 = fe_sq(&g_t0);
+    f_t1 = fe_sq(&f_t1);
+    g_t1 = fe_sq(&g_t1);
+
+    // Step 3: t1 = mul(input, t1)
+    f_t1 = fe_mul(f, &f_t1);
+    g_t1 = fe_mul(g, &g_t1);
+
+    // Step 4: t0 = mul(t0, t1)
+    f_t0 = fe_mul(&f_t0, &f_t1);
+    g_t0 = fe_mul(&g_t0, &g_t1);
+
+    // Step 5: t0 = sq(t0)
+    f_t0 = fe_sq(&f_t0);
+    g_t0 = fe_sq(&g_t0);
+
+    // Step 6: t0 = mul(t1, t0)
+    f_t0 = fe_mul(&f_t1, &f_t0);
+    g_t0 = fe_mul(&g_t1, &g_t0);
+
+    // Step 7: t1 = sq_n(t0, 5)
+    let (mut f_t1, mut g_t1) = fe_sq_n_x2(&f_t0, &g_t0, 5);
+
+    // Step 8: t0 = mul(t1, t0)
+    f_t0 = fe_mul(&f_t1, &f_t0);
+    g_t0 = fe_mul(&g_t1, &g_t0);
+
+    // Step 9: t1 = sq_n(t0, 10)
+    let (f_t1_new, g_t1_new) = fe_sq_n_x2(&f_t0, &g_t0, 10);
+    f_t1 = f_t1_new;
+    g_t1 = g_t1_new;
+
+    // Step 10: t1 = mul(t1, t0)
+    f_t1 = fe_mul(&f_t1, &f_t0);
+    g_t1 = fe_mul(&g_t1, &g_t0);
+
+    // Step 11: t2 = sq_n(t1, 20)
+    let (mut f_t2, mut g_t2) = fe_sq_n_x2(&f_t1, &g_t1, 20);
+
+    // Step 12: t1 = mul(t2, t1)
+    f_t1 = fe_mul(&f_t2, &f_t1);
+    g_t1 = fe_mul(&g_t2, &g_t1);
+
+    // Step 13: t1 = sq_n(t1, 10)
+    let (f_t1_new, g_t1_new) = fe_sq_n_x2(&f_t1, &g_t1, 10);
+    f_t1 = f_t1_new;
+    g_t1 = g_t1_new;
+
+    // Step 14: t0 = mul(t1, t0)
+    f_t0 = fe_mul(&f_t1, &f_t0);
+    g_t0 = fe_mul(&g_t1, &g_t0);
+
+    // Step 15: t1 = sq_n(t0, 50)
+    let (f_t1_new, g_t1_new) = fe_sq_n_x2(&f_t0, &g_t0, 50);
+    f_t1 = f_t1_new;
+    g_t1 = g_t1_new;
+
+    // Step 16: t1 = mul(t1, t0)
+    f_t1 = fe_mul(&f_t1, &f_t0);
+    g_t1 = fe_mul(&g_t1, &g_t0);
+
+    // Step 17: t2 = sq_n(t1, 100)
+    let (f_t2_new, g_t2_new) = fe_sq_n_x2(&f_t1, &g_t1, 100);
+    f_t2 = f_t2_new;
+    g_t2 = g_t2_new;
+
+    // Step 18: t1 = mul(t2, t1)
+    f_t1 = fe_mul(&f_t2, &f_t1);
+    g_t1 = fe_mul(&g_t2, &g_t1);
+
+    // Step 19: t1 = sq_n(t1, 50)
+    let (f_t1_new, g_t1_new) = fe_sq_n_x2(&f_t1, &g_t1, 50);
+    f_t1 = f_t1_new;
+    g_t1 = g_t1_new;
+
+    // Step 20: t0 = mul(t1, t0)
+    f_t0 = fe_mul(&f_t1, &f_t0);
+    g_t0 = fe_mul(&g_t1, &g_t0);
+
+    // Step 21: t0 = sq_n(t0, 2)
+    let (f_t0_new, g_t0_new) = fe_sq_n_x2(&f_t0, &g_t0, 2);
+    f_t0 = f_t0_new;
+    g_t0 = g_t0_new;
+
+    // Step 22: result = mul(t0, input)
+    (fe_mul(&f_t0, f), fe_mul(&g_t0, g))
+}
+
+/// Batched squaring for two independent chains.
+#[inline(always)]
+fn fe_sq_n_x2(f: &[u64; 5], g: &[u64; 5], n: usize) -> ([u64; 5], [u64; 5]) {
+    let mut hf = fe_sq(f);
+    let mut hg = fe_sq(g);
+    for _ in 1..n {
+        hf = fe_sq(&hf);
+        hg = fe_sq(&hg);
+    }
+    (hf, hg)
 }
 
 // ============================================================================
@@ -956,6 +1161,35 @@ fn edwards_add_basepoint(p: &[[u64; 5]; 4]) -> [[u64; 5]; 4] {
     edwards_add_mixed(p, &G_Y_MINUS_X, &G_Y_PLUS_X, &G_TWO_D_T)
 }
 
+/// Precomputed 2G in Niels-like form for mixed addition: (Y-X, Y+X, 2*d*T)
+const TWO_G_Y_MINUS_X: [u64; 5] = [
+    463307831301544,
+    432984605774163,
+    1610641361907204,
+    750899048855000,
+    1894842303421586,
+];
+const TWO_G_Y_PLUS_X: [u64; 5] = [
+    1380971894829527,
+    790832306631236,
+    2067202295274102,
+    1995808275510000,
+    1566530869037010,
+];
+const TWO_G_TWO_D_T: [u64; 5] = [
+    748439484463711,
+    1033211726465151,
+    1396005112841647,
+    1611506220286469,
+    1972177495910992,
+];
+
+/// Add 2G to a point in extended coordinates (advance by 2 keys).
+#[inline(always)]
+fn edwards_add_two_basepoints(p: &[[u64; 5]; 4]) -> [[u64; 5]; 4] {
+    edwards_add_mixed(p, &TWO_G_Y_MINUS_X, &TWO_G_Y_PLUS_X, &TWO_G_TWO_D_T)
+}
+
 trait SearchBackend: Send {
     fn name(&self) -> &'static str;
     fn start(
@@ -1015,21 +1249,23 @@ impl SearchBackend for CpuBackend {
                 let start_point = &base_spend_priv * RISTRETTO_BASEPOINT_TABLE;
                 // Extract into our own limb representation for custom mixed addition
                 let coords = extract_point_coords(&start_point);
-                let mut point_limbs: [[u64; 5]; 4] = [
+                let mut point_a: [[u64; 5]; 4] = [
                     [coords[0], coords[1], coords[2], coords[3], coords[4]],
                     [coords[5], coords[6], coords[7], coords[8], coords[9]],
                     [coords[10], coords[11], coords[12], coords[13], coords[14]],
                     [coords[15], coords[16], coords[17], coords[18], coords[19]],
                 ];
+                let mut point_b = edwards_add_basepoint(&point_a); // B starts 1 ahead
                 let mut local_count: u64 = 0;
                 let mut combined = [0u8; 64];
                 let mut address_bytes = [0u8; 96];
                 combined[32..].copy_from_slice(&view_pub_bytes);
                 let suffix_view_mod = suffix_view_offset(&view_pub_bytes, suffix_modulus);
 
-                loop {
-                    let spend_pub_bytes = ristretto_compress_limbs(&point_limbs);
-                    let spend_pub_bytes = &spend_pub_bytes;
+                // Closure: check a compressed key for match and send result
+                let mut check_match = |spend_pub_bytes: &[u8; 32],
+                                       offset: u64|
+                 -> bool {
                     let mut matched_address: Option<String> = None;
 
                     if use_legacy_base58_matcher {
@@ -1039,8 +1275,10 @@ impl SearchBackend for CpuBackend {
                             .expect("encoding to byte buffer cannot fail");
 
                         let address_view = &address_bytes[..encoded_len];
-                        let prefix_ok = starts_with_ascii_lowered(address_view, &prefix_bytes);
-                        let suffix_ok = ends_with_ascii_lowered(address_view, &suffix_bytes);
+                        let prefix_ok =
+                            starts_with_ascii_lowered(address_view, &prefix_bytes);
+                        let suffix_ok =
+                            ends_with_ascii_lowered(address_view, &suffix_bytes);
 
                         if prefix_ok && suffix_ok {
                             matched_address = Some(
@@ -1060,10 +1298,12 @@ impl SearchBackend for CpuBackend {
                             prefix_ok
                         } else {
                             let mut spend_mod: u64 = 0;
-                            for &byte in spend_pub_bytes {
-                                spend_mod = (spend_mod * 256 + byte as u64) % suffix_modulus;
+                            for &byte in spend_pub_bytes.iter() {
+                                spend_mod =
+                                    (spend_mod * 256 + byte as u64) % suffix_modulus;
                             }
-                            let mod_val = ((spend_mod as u128 * suffix_shift as u128
+                            let mod_val = ((spend_mod as u128
+                                * suffix_shift as u128
                                 + suffix_view_mod as u128)
                                 % suffix_modulus as u128)
                                 as u64;
@@ -1072,13 +1312,13 @@ impl SearchBackend for CpuBackend {
 
                         if prefix_ok && suffix_ok {
                             combined[..32].copy_from_slice(spend_pub_bytes);
-                            matched_address = Some(bs58::encode(&combined).into_string());
+                            matched_address =
+                                Some(bs58::encode(&combined).into_string());
                         }
                     }
 
                     if let Some(address) = matched_address {
-                        // Derive scalar only on match (deferred from hot path)
-                        let spend_priv = base_spend_priv + Scalar::from(local_count);
+                        let spend_priv = base_spend_priv + Scalar::from(offset);
                         let wallet = VanityWallet {
                             address,
                             spend_private_key: hex::encode(spend_priv.as_bytes()),
@@ -1088,12 +1328,37 @@ impl SearchBackend for CpuBackend {
                         };
 
                         if match_tx.send(wallet).is_err() {
-                            return;
+                            return true; // signal exit
                         }
                     }
+                    false
+                };
 
-                    point_limbs = edwards_add_basepoint(&point_limbs);
-                    local_count += 1;
+                loop {
+                    // Pre-phase: compute up to pow input for both keys
+                    let (inter_a, v7_a) = compress_pre(&point_a);
+                    let (inter_b, v7_b) = compress_pre(&point_b);
+
+                    // Interleaved dual exponentiation (the bottleneck)
+                    let (pow_a, pow_b) = fe_pow22523_x2(&v7_a, &v7_b);
+
+                    // Post-phase: finish compression for both keys
+                    let bytes_a = compress_post(&inter_a, &pow_a);
+                    let bytes_b = compress_post(&inter_b, &pow_b);
+
+                    // Check key A
+                    if check_match(&bytes_a, local_count) {
+                        return;
+                    }
+                    // Check key B
+                    if check_match(&bytes_b, local_count + 1) {
+                        return;
+                    }
+
+                    // Advance both points by 2G
+                    point_a = edwards_add_two_basepoints(&point_a);
+                    point_b = edwards_add_two_basepoints(&point_b);
+                    local_count += 2;
                     if local_count & 0x3FF == 0 {
                         counter.fetch_add(1024, Ordering::Relaxed);
                     }
@@ -3355,6 +3620,99 @@ mod tests {
                 "ristretto_compress_limbs mismatch at iteration {}",
                 i
             );
+        }
+    }
+
+    #[test]
+    fn test_fe_pow22523_x2_matches_sequential() {
+        let mut rng = rand::thread_rng();
+        for _ in 0..100 {
+            // Generate two random field elements via random point extraction
+            let s1 = random_scalar(&mut rng);
+            let s2 = random_scalar(&mut rng);
+            let p1 = &s1 * RISTRETTO_BASEPOINT_TABLE;
+            let p2 = &s2 * RISTRETTO_BASEPOINT_TABLE;
+            let c1 = extract_point_coords(&p1);
+            let c2 = extract_point_coords(&p2);
+            let a = [c1[0], c1[1], c1[2], c1[3], c1[4]];
+            let b = [c2[0], c2[1], c2[2], c2[3], c2[4]];
+
+            let (r_a, r_b) = fe_pow22523_x2(&a, &b);
+            let exp_a = fe_pow22523(&a);
+            let exp_b = fe_pow22523(&b);
+
+            // Compare via tobytes (canonical representation)
+            assert_eq!(
+                fe_tobytes(&r_a),
+                fe_tobytes(&exp_a),
+                "fe_pow22523_x2 first output mismatch"
+            );
+            assert_eq!(
+                fe_tobytes(&r_b),
+                fe_tobytes(&exp_b),
+                "fe_pow22523_x2 second output mismatch"
+            );
+        }
+    }
+
+    #[test]
+    fn test_dual_key_compress_matches_single() {
+        // Verify that compress_pre + fe_pow22523 + compress_post produces
+        // identical results to ristretto_compress_limbs.
+        let mut rng = rand::thread_rng();
+        for i in 0..200 {
+            let scalar = random_scalar(&mut rng);
+            let point = &scalar * RISTRETTO_BASEPOINT_TABLE;
+            let coords = extract_point_coords(&point);
+            let limbs: [[u64; 5]; 4] = [
+                [coords[0], coords[1], coords[2], coords[3], coords[4]],
+                [coords[5], coords[6], coords[7], coords[8], coords[9]],
+                [coords[10], coords[11], coords[12], coords[13], coords[14]],
+                [coords[15], coords[16], coords[17], coords[18], coords[19]],
+            ];
+
+            let expected = ristretto_compress_limbs(&limbs);
+            let (inter, v7) = compress_pre(&limbs);
+            let pow = fe_pow22523(&v7);
+            let actual = compress_post(&inter, &pow);
+
+            assert_eq!(
+                actual, expected,
+                "compress_pre/post mismatch at iteration {}",
+                i
+            );
+        }
+    }
+
+    #[test]
+    fn test_edwards_add_two_basepoints_matches_dalek() {
+        // Verify 2G addition matches dalek's double-add
+        let two_g = RISTRETTO_BASEPOINT_POINT + RISTRETTO_BASEPOINT_POINT;
+        let mut rng = rand::thread_rng();
+        let start_scalar = random_scalar(&mut rng);
+        let start_point = &start_scalar * RISTRETTO_BASEPOINT_TABLE;
+        let coords = extract_point_coords(&start_point);
+        let mut point_limbs: [[u64; 5]; 4] = [
+            [coords[0], coords[1], coords[2], coords[3], coords[4]],
+            [coords[5], coords[6], coords[7], coords[8], coords[9]],
+            [coords[10], coords[11], coords[12], coords[13], coords[14]],
+            [coords[15], coords[16], coords[17], coords[18], coords[19]],
+        ];
+
+        let mut dalek_point = start_point;
+
+        for i in 0..500 {
+            let custom_compressed = ristretto_compress_limbs(&point_limbs);
+            let dalek_compressed = dalek_point.compress();
+            assert_eq!(
+                custom_compressed,
+                *dalek_compressed.as_bytes(),
+                "2G addition diverged at step {}",
+                i
+            );
+
+            point_limbs = edwards_add_two_basepoints(&point_limbs);
+            dalek_point += two_g;
         }
     }
 
