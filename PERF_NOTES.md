@@ -253,3 +253,42 @@ Earlier short-window snapshots mixed peak and last-sample reporting and were noi
   - significant prefix gain required
   - suffix impact must remain small/near-flat under strict interleaved A/B
 - Benchmark source of truth remains strict interleaved runs captured by `scripts/bench_cuda_ab.sh`.
+
+## 2026-02-21 checksum regression follow-up (kernel benchmark + recovery)
+
+### Context
+- Checksum rollout commit: `c7c4088`
+- Parent baseline (pre-checksum): `4c062fd`
+- Initial strict A/B (`/tmp/vanity_ab_checksum_regression.csv`, 2 pairs, warmup 8s, measure 16s):
+  - Prefix: `83,826,040 -> 87,220,975` (`+4.05%`)
+  - Suffix: `77,580,556 -> 56,301,992` (`-27.43%`)
+
+### Attempt J (accepted): lightweight checksum absorb + chunked suffix modulo
+- Changes:
+  - Reworked `address_checksum4` absorb path to start from precomputed SHA3 base lanes, avoiding per-key 136-byte block setup.
+  - Restored chunked suffix modulo reduction for checksummed addresses:
+    - 8-byte chunk reduction for `spend_pub` and `view_pub`
+    - 4-byte tail combine for `checksum4`
+  - Added `suffix_chunk_mul` / `suffix_tail_mul` precompute on host and passed to CUDA worker setup.
+- Compile telemetry (release):
+  - `vanity_kernel` stack/spills improved from checksum baseline (`1176B`, `1544/1724`) to (`568B`, `572/748`).
+
+### Clean validation vs checksum baseline (`c7c4088`)
+- Suffix-only strict interleaved A/B (`/tmp/vanity_ab_opt2_suffix_clean.csv`, 3 pairs, warmup 10s, measure 20s):
+  - Baseline avg median: `60,978,599`
+  - Candidate avg median: `62,132,150`
+  - Delta: `+1,153,551` (`+1.89%`)
+- Prefix-only check (`/tmp/vanity_ab_opt2_prefix_clean.csv`, 2 pairs, warmup 8s, measure 16s):
+  - Baseline avg median: `92,241,660`
+  - Candidate avg median: `91,535,618`
+  - Delta: `-706,042` (`-0.77%`)
+
+### Position vs pre-checksum parent (`4c062fd`)
+- Interleaved A/B (`/tmp/vanity_ab_parent_vs_opt2.csv`, 2 pairs, warmup 8s, measure 16s):
+  - Prefix: `94,540,444 -> 93,841,348` (`-0.74%`)
+  - Suffix: `82,386,436 -> 62,787,102` (`-23.79%`)
+- Net: this recovers part of the checksum suffix regression (from `-27.43%` to `-23.79%` in this setup), but not all of it.
+
+### Notes
+- One intermediate suffix run showed a severe outlier due accidental external GPU miner activity and was discarded.
+- Final accepted numbers above are from clean runs with miner stopped and interleaved ordering.

@@ -313,6 +313,18 @@ fn compute_suffix_targets(suffix_lower: &str) -> (u64, Vec<u64>) {
     (modulus, targets)
 }
 
+#[inline]
+fn suffix_pow256_mod(exp_bytes: usize, modulus: u64) -> u64 {
+    if modulus == 0 {
+        return 0;
+    }
+    let mut result: u64 = 1;
+    for _ in 0..exp_bytes {
+        result = ((result as u128 * 256) % modulus as u128) as u64;
+    }
+    result
+}
+
 #[inline(always)]
 fn checksum_base_hasher() -> Sha3_256 {
     let mut hasher = Sha3_256::new();
@@ -1598,6 +1610,8 @@ unsafe extern "C" {
         suffix_modulus: u64,
         suffix_targets: *const u64,
         num_suffix_targets: i32,
+        suffix_chunk_mul: u64,
+        suffix_tail_mul: u64,
     ) -> i32;
 
     fn cuda_worker_submit_v2(
@@ -1769,6 +1783,8 @@ impl SearchBackend for CudaBackend {
             // Precompute ranges on CPU (once, shared by all workers)
             let prefix_ranges = compute_prefix_ranges(&config.prefix_lower);
             let (suffix_modulus, suffix_targets) = compute_suffix_targets(&config.suffix_lower);
+            let suffix_chunk_mul = suffix_pow256_mod(8, suffix_modulus);
+            let suffix_tail_mul = suffix_pow256_mod(4, suffix_modulus);
 
             // Flatten prefix ranges into contiguous bytes:
             // [lo0[68] hi0[68] lo1[68] hi1[68] ...]
@@ -1848,6 +1864,8 @@ impl SearchBackend for CudaBackend {
                                 suffix_targets.as_ptr()
                             },
                             suffix_targets.len() as i32,
+                            suffix_chunk_mul,
+                            suffix_tail_mul,
                         )
                     };
                     if rc != 0 {
@@ -2559,6 +2577,8 @@ mod tests {
                 prefix_ranges.len() as i32,
                 0, // no suffix
                 std::ptr::null(),
+                0,
+                0,
                 0,
             )
         };
@@ -4129,6 +4149,8 @@ mod tests {
                 0, // no suffix
                 std::ptr::null(),
                 0,
+                0,
+                0,
             )
         };
         assert_eq!(rc, 0, "cuda_worker_set_ranges failed");
@@ -4209,6 +4231,8 @@ mod tests {
 
         for suffix in &suffixes {
             let (suffix_modulus, suffix_targets) = compute_suffix_targets(suffix);
+            let suffix_chunk_mul = suffix_pow256_mod(8, suffix_modulus);
+            let suffix_tail_mul = suffix_pow256_mod(4, suffix_modulus);
 
             let prefix_c = CString::new("").unwrap();
             let suffix_c = CString::new(*suffix).unwrap();
@@ -4233,6 +4257,8 @@ mod tests {
                     suffix_modulus,
                     suffix_targets.as_ptr(),
                     suffix_targets.len() as i32,
+                    suffix_chunk_mul,
+                    suffix_tail_mul,
                 )
             };
             assert_eq!(rc, 0, "cuda_worker_set_ranges failed");

@@ -17,7 +17,6 @@ typedef unsigned __int128 u128;
 #define ADDRESS_PUBKEY_BYTES 64
 #define ADDRESS_CHECKSUM_BYTES 4
 #define ADDRESS_TOTAL_BYTES (ADDRESS_PUBKEY_BYTES + ADDRESS_CHECKSUM_BYTES)
-#define ADDRESS_PREFIX_LEN 49
 
 struct fe25519 {
     u64 v[5];
@@ -551,8 +550,17 @@ __device__ void ristretto_encode(uint8_t* out, const ge25519_p3* P) {
 
 __device__ __constant__ char BASE58_ALPHABET_DEVICE[] =
     "123456789ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz";
-__device__ __constant__ char ADDRESS_CHECKSUM_PREFIX[] =
-    "blocknet_stealth_address_checksumblocknet_mainnet";
+// SHA3-256 one-block absorb base lanes for:
+// "blocknet_stealth_address_checksumblocknet_mainnet" || spend_pub || view_pub || 0x06 || ... || 0x80
+// with spend_pub/view_pub bytes left zero and padding bits pre-set.
+__device__ __constant__ u64 ADDRESS_CHECKSUM_BASE_LANES[17] = {
+    0x74656e6b636f6c62ULL, 0x68746c616574735fULL, 0x737365726464615fULL,
+    0x75736b636568635fULL, 0x656e6b636f6c626dULL, 0x656e6e69616d5f74ULL,
+    0x0000000000000074ULL, 0x0000000000000000ULL, 0x0000000000000000ULL,
+    0x0000000000000000ULL, 0x0000000000000000ULL, 0x0000000000000000ULL,
+    0x0000000000000000ULL, 0x0000000000000000ULL, 0x0000000000000600ULL,
+    0x0000000000000000ULL, 0x8000000000000000ULL
+};
 
 __device__ __forceinline__ char ascii_lower(char c) {
     if (c >= 'A' && c <= 'Z') return (char)(c + 32);
@@ -594,6 +602,15 @@ __device__ __forceinline__ u64 load64_le(const uint8_t* src) {
     u64 v = 0;
     for (int i = 0; i < 8; i++) {
         v |= ((u64)src[i]) << (8 * i);
+    }
+    return v;
+}
+
+__device__ __forceinline__ u64 load64_be(const uint8_t* src) {
+    u64 v = 0;
+    #pragma unroll
+    for (int i = 0; i < 8; i++) {
+        v = (v << 8) | (u64)src[i];
     }
     return v;
 }
@@ -648,31 +665,27 @@ __device__ __forceinline__ void address_checksum4(
     const uint8_t* view_pub,
     uint8_t out4[4]
 ) {
-    // SHA3-256: rate = 136 bytes.
-    uint8_t block[136];
-    #pragma unroll
-    for (int i = 0; i < 136; i++) block[i] = 0;
-
-    #pragma unroll
-    for (int i = 0; i < ADDRESS_PREFIX_LEN; i++) {
-        block[i] = (uint8_t)ADDRESS_CHECKSUM_PREFIX[i];
-    }
-    #pragma unroll
-    for (int i = 0; i < 32; i++) block[ADDRESS_PREFIX_LEN + i] = spend_pub[i];
-    #pragma unroll
-    for (int i = 0; i < 32; i++) block[ADDRESS_PREFIX_LEN + 32 + i] = view_pub[i];
-
-    const int msg_len = ADDRESS_PREFIX_LEN + ADDRESS_PUBKEY_BYTES; // 113
-    block[msg_len] = 0x06;   // SHA3 domain separator
-    block[135] |= 0x80;      // pad10*1 final bit
-
     u64 st[25];
     #pragma unroll
-    for (int i = 0; i < 25; i++) st[i] = 0;
+    for (int i = 0; i < 17; i++) st[i] = ADDRESS_CHECKSUM_BASE_LANES[i];
     #pragma unroll
-    for (int lane = 0; lane < 17; lane++) {
-        st[lane] ^= load64_le(block + lane * 8);
+    for (int i = 17; i < 25; i++) st[i] = 0;
+
+    // spend_pub starts at byte offset 49 (lane 6, shift 8)
+    #pragma unroll
+    for (int i = 0; i < 4; i++) {
+        u64 chunk = load64_le(spend_pub + i * 8);
+        st[6 + i] ^= (chunk << 8);
+        st[7 + i] ^= (chunk >> 56);
     }
+    // view_pub starts at byte offset 81 (lane 10, shift 8)
+    #pragma unroll
+    for (int i = 0; i < 4; i++) {
+        u64 chunk = load64_le(view_pub + i * 8);
+        st[10 + i] ^= (chunk << 8);
+        st[11 + i] ^= (chunk >> 56);
+    }
+
     keccakf(st);
 
     out4[0] = (uint8_t)(st[0] & 0xFF);
@@ -838,6 +851,35 @@ __device__ __forceinline__ int cmp_checksum4_to_bound(
     return 0;
 }
 
+__device__ __forceinline__ u64 suffix_mod_for_address(
+    const uint8_t* spend_pub,
+    const uint8_t* view_pub,
+    const uint8_t* checksum4,
+    u64 suffix_modulus,
+    u64 suffix_chunk_mul,
+    u64 suffix_tail_mul
+) {
+    u64 mod_val = 0;
+
+    #pragma unroll
+    for (int i = 0; i < 4; i++) {
+        u64 chunk = load64_be(spend_pub + i * 8);
+        mod_val = (u64)(((u128)mod_val * suffix_chunk_mul + chunk) % suffix_modulus);
+    }
+    #pragma unroll
+    for (int i = 0; i < 4; i++) {
+        u64 chunk = load64_be(view_pub + i * 8);
+        mod_val = (u64)(((u128)mod_val * suffix_chunk_mul + chunk) % suffix_modulus);
+    }
+
+    u64 checksum_chunk = ((u64)checksum4[0] << 24)
+                       | ((u64)checksum4[1] << 16)
+                       | ((u64)checksum4[2] << 8)
+                       | (u64)checksum4[3];
+
+    return (u64)(((u128)mod_val * suffix_tail_mul + checksum_chunk) % suffix_modulus);
+}
+
 __global__ void __launch_bounds__(256, VANITY_GENERIC_LAUNCH_MIN_BLOCKS) vanity_kernel(
     // Starting point P (in extended Edwards coordinates, as 5 u64 limbs each)
     const u64* start_X, const u64* start_Y, const u64* start_Z, const u64* start_T,
@@ -846,6 +888,7 @@ __global__ void __launch_bounds__(256, VANITY_GENERIC_LAUNCH_MIN_BLOCKS) vanity_
     // Range-based matching (replaces base58 encoding)
     const uint8_t* prefix_ranges, int num_prefix_ranges,
     u64 suffix_modulus, const u64* suffix_targets, int num_suffix_targets,
+    u64 suffix_chunk_mul, u64 suffix_tail_mul,
     // Batch: total number of keys (must be multiple of KEYS_PER_THREAD)
     int batch_size,
     // Output: flags (1=match, 0=no match), indexed by key_index [0..batch_size)
@@ -963,17 +1006,14 @@ __global__ void __launch_bounds__(256, VANITY_GENERIC_LAUNCH_MIN_BLOCKS) vanity_
                 address_checksum4(spend_pub, view_pub, checksum4);
                 checksum_ready = true;
             }
-            u64 mod_val = 0;
-            for (int i = 0; i < 32; i++) {
-                mod_val = (mod_val * 256 + spend_pub[i]) % suffix_modulus;
-            }
-            for (int i = 0; i < 32; i++) {
-                mod_val = (mod_val * 256 + view_pub[i]) % suffix_modulus;
-            }
-            #pragma unroll
-            for (int i = 0; i < 4; i++) {
-                mod_val = (mod_val * 256 + checksum4[i]) % suffix_modulus;
-            }
+            u64 mod_val = suffix_mod_for_address(
+                spend_pub,
+                view_pub,
+                checksum4,
+                suffix_modulus,
+                suffix_chunk_mul,
+                suffix_tail_mul
+            );
 
             int t_left = 0;
             int t_right = num_suffix_targets;
@@ -1123,6 +1163,8 @@ struct CudaWorker {
     u64 suffix_modulus;           // 58^suffix_len, or 0 if no suffix
     u64* d_suffix_targets;        // array of valid mod targets
     int num_suffix_targets;
+    u64 suffix_chunk_mul;         // 256^8 mod suffix_modulus
+    u64 suffix_tail_mul;          // 256^4 mod suffix_modulus (checksum4 tail)
 
     // Legacy mode device memory
     uint8_t* d_inputs;
@@ -1173,6 +1215,8 @@ extern "C" void* cuda_worker_create(
     w->suffix_modulus = 0;
     w->d_suffix_targets = nullptr;
     w->num_suffix_targets = 0;
+    w->suffix_chunk_mul = 0;
+    w->suffix_tail_mul = 0;
 
     cudaStreamCreate(&w->stream);
 
@@ -1220,7 +1264,9 @@ extern "C" int cuda_worker_set_ranges(
     void* handle,
     const uint8_t* prefix_ranges, int num_prefix_ranges,  // num_prefix_ranges * 136 bytes
     u64 suffix_modulus,
-    const u64* suffix_targets, int num_suffix_targets
+    const u64* suffix_targets, int num_suffix_targets,
+    u64 suffix_chunk_mul,
+    u64 suffix_tail_mul
 ) {
     CudaWorker* w = (CudaWorker*)handle;
 
@@ -1231,6 +1277,8 @@ extern "C" int cuda_worker_set_ranges(
     w->num_prefix_ranges = num_prefix_ranges;
     w->suffix_modulus = suffix_modulus;
     w->num_suffix_targets = num_suffix_targets;
+    w->suffix_chunk_mul = suffix_chunk_mul;
+    w->suffix_tail_mul = suffix_tail_mul;
 
     // Allocate and copy prefix ranges
     if (num_prefix_ranges > 0) {
@@ -1302,6 +1350,7 @@ extern "C" int cuda_worker_submit_v2(
             w->d_view_pub,
             w->d_prefix_ranges, w->num_prefix_ranges,
             w->suffix_modulus, w->d_suffix_targets, w->num_suffix_targets,
+            w->suffix_chunk_mul, w->suffix_tail_mul,
             count,
             w->d_flags
         );
