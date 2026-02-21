@@ -4,7 +4,7 @@ Vanity address generator for Blocknet. Brute-forces keypairs to find addresses m
 
 ## how it works
 
-A Blocknet address is `base58(spend_public_key || view_public_key)`. The generator fixes the view keypair per thread and increments the spend scalar, requiring only one scalar multiplication per candidate. Matching is case-insensitive.
+A Blocknet address is `base58(spend_public_key || view_public_key || checksum4)`, where `checksum4` is the first 4 bytes of `SHA3-256("blocknet_stealth_address_checksum" || "blocknet_mainnet" || spend_public_key || view_public_key)`. The generator fixes the view keypair per thread and increments the spend scalar, requiring only one scalar multiplication per candidate. Matching is case-insensitive.
 
 ## download
 

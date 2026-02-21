@@ -11,6 +11,14 @@
 typedef unsigned long long u64;
 typedef unsigned __int128 u128;
 
+// Address format:
+// base58(spend_pub[32] || view_pub[32] || checksum4)
+// checksum4 = first 4 bytes of SHA3-256("blocknet_stealth_address_checksum" || "blocknet_mainnet" || spend_pub || view_pub)
+#define ADDRESS_PUBKEY_BYTES 64
+#define ADDRESS_CHECKSUM_BYTES 4
+#define ADDRESS_TOTAL_BYTES (ADDRESS_PUBKEY_BYTES + ADDRESS_CHECKSUM_BYTES)
+#define ADDRESS_PREFIX_LEN 49
+
 struct fe25519 {
     u64 v[5];
 };
@@ -543,10 +551,134 @@ __device__ void ristretto_encode(uint8_t* out, const ge25519_p3* P) {
 
 __device__ __constant__ char BASE58_ALPHABET_DEVICE[] =
     "123456789ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz";
+__device__ __constant__ char ADDRESS_CHECKSUM_PREFIX[] =
+    "blocknet_stealth_address_checksumblocknet_mainnet";
 
 __device__ __forceinline__ char ascii_lower(char c) {
     if (c >= 'A' && c <= 'Z') return (char)(c + 32);
     return c;
+}
+
+__device__ __forceinline__ u64 rotl64(u64 x, int s) {
+    return (x << s) | (x >> (64 - s));
+}
+
+__device__ __constant__ u64 KECCAKF_RNDC[24] = {
+    0x0000000000000001ULL, 0x0000000000008082ULL,
+    0x800000000000808aULL, 0x8000000080008000ULL,
+    0x000000000000808bULL, 0x0000000080000001ULL,
+    0x8000000080008081ULL, 0x8000000000008009ULL,
+    0x000000000000008aULL, 0x0000000000000088ULL,
+    0x0000000080008009ULL, 0x000000008000000aULL,
+    0x000000008000808bULL, 0x800000000000008bULL,
+    0x8000000000008089ULL, 0x8000000000008003ULL,
+    0x8000000000008002ULL, 0x8000000000000080ULL,
+    0x000000000000800aULL, 0x800000008000000aULL,
+    0x8000000080008081ULL, 0x8000000000008080ULL,
+    0x0000000080000001ULL, 0x8000000080008008ULL
+};
+
+__device__ __constant__ int KECCAKF_ROTC[24] = {
+    1,  3,  6, 10, 15, 21, 28, 36,
+    45, 55,  2, 14, 27, 41, 56,  8,
+    25, 43, 62, 18, 39, 61, 20, 44
+};
+
+__device__ __constant__ int KECCAKF_PILN[24] = {
+    10,  7, 11, 17, 18,  3,  5, 16,
+     8, 21, 24,  4, 15, 23, 19, 13,
+    12,  2, 20, 14, 22,  9,  6,  1
+};
+
+__device__ __forceinline__ u64 load64_le(const uint8_t* src) {
+    u64 v = 0;
+    for (int i = 0; i < 8; i++) {
+        v |= ((u64)src[i]) << (8 * i);
+    }
+    return v;
+}
+
+__device__ void keccakf(u64 st[25]) {
+    u64 bc[5];
+    for (int round = 0; round < 24; round++) {
+        // Theta
+        for (int i = 0; i < 5; i++) {
+            bc[i] = st[i] ^ st[i + 5] ^ st[i + 10] ^ st[i + 15] ^ st[i + 20];
+        }
+        for (int i = 0; i < 5; i++) {
+            u64 t = bc[(i + 4) % 5] ^ rotl64(bc[(i + 1) % 5], 1);
+            st[i] ^= t;
+            st[i + 5] ^= t;
+            st[i + 10] ^= t;
+            st[i + 15] ^= t;
+            st[i + 20] ^= t;
+        }
+
+        // Rho + Pi
+        u64 t = st[1];
+        for (int i = 0; i < 24; i++) {
+            int j = KECCAKF_PILN[i];
+            u64 tmp = st[j];
+            st[j] = rotl64(t, KECCAKF_ROTC[i]);
+            t = tmp;
+        }
+
+        // Chi
+        for (int j = 0; j < 25; j += 5) {
+            u64 s0 = st[j + 0];
+            u64 s1 = st[j + 1];
+            u64 s2 = st[j + 2];
+            u64 s3 = st[j + 3];
+            u64 s4 = st[j + 4];
+            st[j + 0] = s0 ^ ((~s1) & s2);
+            st[j + 1] = s1 ^ ((~s2) & s3);
+            st[j + 2] = s2 ^ ((~s3) & s4);
+            st[j + 3] = s3 ^ ((~s4) & s0);
+            st[j + 4] = s4 ^ ((~s0) & s1);
+        }
+
+        // Iota
+        st[0] ^= KECCAKF_RNDC[round];
+    }
+}
+
+// checksum4 = first 4 bytes of SHA3-256(tag || network_id || spend_pub || view_pub)
+__device__ __forceinline__ void address_checksum4(
+    const uint8_t* spend_pub,
+    const uint8_t* view_pub,
+    uint8_t out4[4]
+) {
+    // SHA3-256: rate = 136 bytes.
+    uint8_t block[136];
+    #pragma unroll
+    for (int i = 0; i < 136; i++) block[i] = 0;
+
+    #pragma unroll
+    for (int i = 0; i < ADDRESS_PREFIX_LEN; i++) {
+        block[i] = (uint8_t)ADDRESS_CHECKSUM_PREFIX[i];
+    }
+    #pragma unroll
+    for (int i = 0; i < 32; i++) block[ADDRESS_PREFIX_LEN + i] = spend_pub[i];
+    #pragma unroll
+    for (int i = 0; i < 32; i++) block[ADDRESS_PREFIX_LEN + 32 + i] = view_pub[i];
+
+    const int msg_len = ADDRESS_PREFIX_LEN + ADDRESS_PUBKEY_BYTES; // 113
+    block[msg_len] = 0x06;   // SHA3 domain separator
+    block[135] |= 0x80;      // pad10*1 final bit
+
+    u64 st[25];
+    #pragma unroll
+    for (int i = 0; i < 25; i++) st[i] = 0;
+    #pragma unroll
+    for (int lane = 0; lane < 17; lane++) {
+        st[lane] ^= load64_le(block + lane * 8);
+    }
+    keccakf(st);
+
+    out4[0] = (uint8_t)(st[0] & 0xFF);
+    out4[1] = (uint8_t)((st[0] >> 8) & 0xFF);
+    out4[2] = (uint8_t)((st[0] >> 16) & 0xFF);
+    out4[3] = (uint8_t)((st[0] >> 24) & 0xFF);
 }
 
 // Base58 using radix-58^4 = 11,316,496 for ~4x fewer inner-loop iterations
@@ -554,11 +686,11 @@ __device__ __forceinline__ char ascii_lower(char c) {
 // Max intermediate value during carry: 255 + 11316495 * 256 = 2,896,982,975 < 2^32
 #define BASE58_POW4 11316496U
 
-__device__ int encode_base58_64(const uint8_t* input, char* out) {
-    uint32_t groups[24];  // enough for 64 bytes in base-58^4 (88 digits / 4 = 22, +margin)
+__device__ int encode_base58(const uint8_t* input, int input_len, char* out) {
+    uint32_t groups[28];  // enough for 68-byte input with margin
     int ngroups = 0;
 
-    for (int i = 0; i < 64; ++i) {
+    for (int i = 0; i < input_len; ++i) {
         uint32_t carry = (uint32_t)input[i];
         for (int j = 0; j < ngroups; ++j) {
             uint64_t acc = (uint64_t)groups[j] * 256 + carry;
@@ -572,7 +704,7 @@ __device__ int encode_base58_64(const uint8_t* input, char* out) {
     }
 
     // Convert groups to individual base-58 digits (little-endian within each group)
-    uint8_t digits[96];
+    uint8_t digits[128];
     int ndigits = 0;
     for (int g = 0; g < ngroups - 1; ++g) {
         uint32_t val = groups[g];
@@ -592,7 +724,7 @@ __device__ int encode_base58_64(const uint8_t* input, char* out) {
 
     // Count leading zero bytes -> leading '1's
     int leading_zeros = 0;
-    while (leading_zeros < 64 && input[leading_zeros] == 0) leading_zeros++;
+    while (leading_zeros < input_len && input[leading_zeros] == 0) leading_zeros++;
     for (int i = 0; i < leading_zeros; ++i) digits[ndigits++] = 0;
 
     // Reverse into output with alphabet mapping
@@ -615,9 +747,19 @@ __global__ void match_kernel(
     int tid = (int)(blockIdx.x * blockDim.x + threadIdx.x);
     if (tid >= batch_size) return;
 
-    const uint8_t* input = inputs_64 + (tid * 64);
-    char addr[96];
-    int addr_len = encode_base58_64(input, addr);
+    const uint8_t* input = inputs_64 + (tid * ADDRESS_PUBKEY_BYTES);
+    uint8_t combined[ADDRESS_TOTAL_BYTES];
+    for (int i = 0; i < ADDRESS_PUBKEY_BYTES; i++) combined[i] = input[i];
+
+    uint8_t checksum4[4];
+    address_checksum4(input, input + 32, checksum4);
+    combined[64] = checksum4[0];
+    combined[65] = checksum4[1];
+    combined[66] = checksum4[2];
+    combined[67] = checksum4[3];
+
+    char addr[128];
+    int addr_len = encode_base58(combined, ADDRESS_TOTAL_BYTES, addr);
 
     bool prefix_ok = true;
     if (prefix_len > 0) {
@@ -659,7 +801,7 @@ __global__ void match_kernel(
 __device__ ge25519_p3 d_gen_table[TABLE_SIZE];
 __device__ fe25519 d_view_pub_fe[1];  // not used directly, but view_pub bytes are
 
-__device__ __forceinline__ int cmp_combined_split_to_bound(
+__device__ __forceinline__ int cmp_spend_view_split_to_bound(
     const uint8_t* spend_pub,
     const uint8_t* view_pub,
     const uint8_t* bound
@@ -684,6 +826,18 @@ __device__ __forceinline__ int cmp_combined_split_to_bound(
 #define VANITY_GENERIC_LAUNCH_MIN_BLOCKS 2
 #endif
 
+__device__ __forceinline__ int cmp_checksum4_to_bound(
+    const uint8_t* checksum4,
+    const uint8_t* bound
+) {
+    for (int i = 0; i < 4; i++) {
+        uint8_t b = bound[64 + i];
+        if (checksum4[i] < b) return -1;
+        if (checksum4[i] > b) return 1;
+    }
+    return 0;
+}
+
 __global__ void __launch_bounds__(256, VANITY_GENERIC_LAUNCH_MIN_BLOCKS) vanity_kernel(
     // Starting point P (in extended Edwards coordinates, as 5 u64 limbs each)
     const u64* start_X, const u64* start_Y, const u64* start_Z, const u64* start_T,
@@ -692,7 +846,6 @@ __global__ void __launch_bounds__(256, VANITY_GENERIC_LAUNCH_MIN_BLOCKS) vanity_
     // Range-based matching (replaces base58 encoding)
     const uint8_t* prefix_ranges, int num_prefix_ranges,
     u64 suffix_modulus, const u64* suffix_targets, int num_suffix_targets,
-    u64 suffix_shift_mod, u64 suffix_chunk_mul, u64 suffix_view_offset,
     // Batch: total number of keys (must be multiple of KEYS_PER_THREAD)
     int batch_size,
     // Output: flags (1=match, 0=no match), indexed by key_index [0..batch_size)
@@ -753,6 +906,8 @@ __global__ void __launch_bounds__(256, VANITY_GENERIC_LAUNCH_MIN_BLOCKS) vanity_
         // Ristretto compress -> 32 bytes spend_pub
         uint8_t spend_pub[32];
         ristretto_encode(spend_pub, &point);
+        uint8_t checksum4[4];
+        bool checksum_ready = false;
 
         // PREFIX CHECK: binary search over sorted, non-overlapping [lo, hi) ranges.
         bool prefix_ok = (num_prefix_ranges == 0);  // no prefix = always match
@@ -761,19 +916,42 @@ __global__ void __launch_bounds__(256, VANITY_GENERIC_LAUNCH_MIN_BLOCKS) vanity_
             int right = num_prefix_ranges;
             while (left < right) {
                 int mid = left + ((right - left) >> 1);
-                const uint8_t* lo = prefix_ranges + mid * 128;
-                int cmp_lo = cmp_combined_split_to_bound(spend_pub, view_pub, lo);
-                if (cmp_lo < 0) {
+                const uint8_t* lo = prefix_ranges + mid * (2 * ADDRESS_TOTAL_BYTES);
+                int cmp_lo_sv = cmp_spend_view_split_to_bound(spend_pub, view_pub, lo);
+                if (cmp_lo_sv < 0) {
                     right = mid;
                     continue;
                 }
+                if (cmp_lo_sv == 0) {
+                    if (!checksum_ready) {
+                        address_checksum4(spend_pub, view_pub, checksum4);
+                        checksum_ready = true;
+                    }
+                    int cmp_lo_checksum = cmp_checksum4_to_bound(checksum4, lo);
+                    if (cmp_lo_checksum < 0) {
+                        right = mid;
+                        continue;
+                    }
+                }
 
-                const uint8_t* hi = lo + 64;
-                int cmp_hi = cmp_combined_split_to_bound(spend_pub, view_pub, hi);
-                if (cmp_hi < 0) {
+                const uint8_t* hi = lo + ADDRESS_TOTAL_BYTES;
+                int cmp_hi_sv = cmp_spend_view_split_to_bound(spend_pub, view_pub, hi);
+                if (cmp_hi_sv < 0) {
                     prefix_ok = true;
                     break;
                 }
+                if (cmp_hi_sv == 0) {
+                    if (!checksum_ready) {
+                        address_checksum4(spend_pub, view_pub, checksum4);
+                        checksum_ready = true;
+                    }
+                    int cmp_hi_checksum = cmp_checksum4_to_bound(checksum4, hi);
+                    if (cmp_hi_checksum < 0) {
+                        prefix_ok = true;
+                        break;
+                    }
+                }
+
                 left = mid + 1;
             }
         }
@@ -781,19 +959,21 @@ __global__ void __launch_bounds__(256, VANITY_GENERIC_LAUNCH_MIN_BLOCKS) vanity_
         // SUFFIX CHECK: modular arithmetic (only if prefix matched)
         bool suffix_ok = (num_suffix_targets == 0);  // no suffix = always match
         if (prefix_ok && !suffix_ok) {
-            // Half-length loop: only spend_pub (32 bytes), precomputed view_pub contribution
-            // combined mod m = (spend_mod * shift_mod + view_offset) mod m
-            u64 spend_mod = 0;
-            for (int chunk_idx = 0; chunk_idx < 4; ++chunk_idx) {
-                u64 chunk = 0;
-                #pragma unroll
-                for (int j = 0; j < 8; ++j) {
-                    chunk = (chunk << 8) | spend_pub[chunk_idx * 8 + j];
-                }
-                spend_mod = (u64)(((u128)spend_mod * suffix_chunk_mul + chunk) % suffix_modulus);
+            if (!checksum_ready) {
+                address_checksum4(spend_pub, view_pub, checksum4);
+                checksum_ready = true;
             }
-            // Keep the multiply in 128-bit to support suffix lengths up to 8 safely.
-            u64 mod_val = (u64)(((u128)spend_mod * suffix_shift_mod + suffix_view_offset) % suffix_modulus);
+            u64 mod_val = 0;
+            for (int i = 0; i < 32; i++) {
+                mod_val = (mod_val * 256 + spend_pub[i]) % suffix_modulus;
+            }
+            for (int i = 0; i < 32; i++) {
+                mod_val = (mod_val * 256 + view_pub[i]) % suffix_modulus;
+            }
+            #pragma unroll
+            for (int i = 0; i < 4; i++) {
+                mod_val = (mod_val * 256 + checksum4[i]) % suffix_modulus;
+            }
 
             int t_left = 0;
             int t_right = num_suffix_targets;
@@ -866,24 +1046,48 @@ __global__ void __launch_bounds__(256, VANITY_PREFIX_LAUNCH_MIN_BLOCKS) vanity_k
 
         uint8_t spend_pub[32];
         ristretto_encode(spend_pub, &point);
+        uint8_t checksum4[4];
+        bool checksum_ready = false;
 
         bool prefix_ok = false;
         int left = 0;
         int right = num_prefix_ranges;
         while (left < right) {
             int mid = left + ((right - left) >> 1);
-            const uint8_t* lo = prefix_ranges + mid * 128;
-            int cmp_lo = cmp_combined_split_to_bound(spend_pub, view_pub, lo);
-            if (cmp_lo < 0) {
+            const uint8_t* lo = prefix_ranges + mid * (2 * ADDRESS_TOTAL_BYTES);
+            int cmp_lo_sv = cmp_spend_view_split_to_bound(spend_pub, view_pub, lo);
+            if (cmp_lo_sv < 0) {
                 right = mid;
                 continue;
             }
+            if (cmp_lo_sv == 0) {
+                if (!checksum_ready) {
+                    address_checksum4(spend_pub, view_pub, checksum4);
+                    checksum_ready = true;
+                }
+                int cmp_lo_checksum = cmp_checksum4_to_bound(checksum4, lo);
+                if (cmp_lo_checksum < 0) {
+                    right = mid;
+                    continue;
+                }
+            }
 
-            const uint8_t* hi = lo + 64;
-            int cmp_hi = cmp_combined_split_to_bound(spend_pub, view_pub, hi);
-            if (cmp_hi < 0) {
+            const uint8_t* hi = lo + ADDRESS_TOTAL_BYTES;
+            int cmp_hi_sv = cmp_spend_view_split_to_bound(spend_pub, view_pub, hi);
+            if (cmp_hi_sv < 0) {
                 prefix_ok = true;
                 break;
+            }
+            if (cmp_hi_sv == 0) {
+                if (!checksum_ready) {
+                    address_checksum4(spend_pub, view_pub, checksum4);
+                    checksum_ready = true;
+                }
+                int cmp_hi_checksum = cmp_checksum4_to_bound(checksum4, hi);
+                if (cmp_hi_checksum < 0) {
+                    prefix_ok = true;
+                    break;
+                }
             }
             left = mid + 1;
         }
@@ -914,14 +1118,11 @@ struct CudaWorker {
     uint8_t* h_flags;
 
     // Range-based matching (replaces base58 encoding on GPU)
-    uint8_t* d_prefix_ranges;    // num_prefix_ranges * 128 bytes (lo[64] || hi[64])
+    uint8_t* d_prefix_ranges;    // num_prefix_ranges * 136 bytes (lo[68] || hi[68])
     int num_prefix_ranges;
     u64 suffix_modulus;           // 58^suffix_len, or 0 if no suffix
     u64* d_suffix_targets;        // array of valid mod targets
     int num_suffix_targets;
-    u64 suffix_shift_mod;         // 256^32 mod suffix_modulus (for half-length loop)
-    u64 suffix_chunk_mul;         // 256^8 mod suffix_modulus (for 8-byte chunk loop)
-    u64 suffix_view_offset;       // view_pub_as_bigendian mod suffix_modulus
 
     // Legacy mode device memory
     uint8_t* d_inputs;
@@ -972,9 +1173,6 @@ extern "C" void* cuda_worker_create(
     w->suffix_modulus = 0;
     w->d_suffix_targets = nullptr;
     w->num_suffix_targets = 0;
-    w->suffix_shift_mod = 0;
-    w->suffix_chunk_mul = 0;
-    w->suffix_view_offset = 0;
 
     cudaStreamCreate(&w->stream);
 
@@ -1020,12 +1218,9 @@ extern "C" void* cuda_worker_create(
 // Set precomputed ranges for range-based matching (replaces base58 on GPU)
 extern "C" int cuda_worker_set_ranges(
     void* handle,
-    const uint8_t* prefix_ranges, int num_prefix_ranges,  // num_prefix_ranges * 128 bytes
+    const uint8_t* prefix_ranges, int num_prefix_ranges,  // num_prefix_ranges * 136 bytes
     u64 suffix_modulus,
-    const u64* suffix_targets, int num_suffix_targets,
-    u64 suffix_shift_mod,       // 256^32 mod suffix_modulus
-    u64 suffix_chunk_mul,       // 256^8 mod suffix_modulus
-    u64 suffix_view_offset      // view_pub_as_bigendian mod suffix_modulus
+    const u64* suffix_targets, int num_suffix_targets
 ) {
     CudaWorker* w = (CudaWorker*)handle;
 
@@ -1036,13 +1231,10 @@ extern "C" int cuda_worker_set_ranges(
     w->num_prefix_ranges = num_prefix_ranges;
     w->suffix_modulus = suffix_modulus;
     w->num_suffix_targets = num_suffix_targets;
-    w->suffix_shift_mod = suffix_shift_mod;
-    w->suffix_chunk_mul = suffix_chunk_mul;
-    w->suffix_view_offset = suffix_view_offset;
 
     // Allocate and copy prefix ranges
     if (num_prefix_ranges > 0) {
-        size_t range_size = (size_t)num_prefix_ranges * 128;
+        size_t range_size = (size_t)num_prefix_ranges * (2 * ADDRESS_TOTAL_BYTES);
         if (cudaMalloc(&w->d_prefix_ranges, range_size) != cudaSuccess) return 1;
         if (cudaMemcpy(w->d_prefix_ranges, prefix_ranges, range_size, cudaMemcpyHostToDevice) != cudaSuccess) return 2;
     } else {
@@ -1110,7 +1302,6 @@ extern "C" int cuda_worker_submit_v2(
             w->d_view_pub,
             w->d_prefix_ranges, w->num_prefix_ranges,
             w->suffix_modulus, w->d_suffix_targets, w->num_suffix_targets,
-            w->suffix_shift_mod, w->suffix_chunk_mul, w->suffix_view_offset,
             count,
             w->d_flags
         );

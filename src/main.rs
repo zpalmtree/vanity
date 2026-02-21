@@ -16,9 +16,18 @@ use curve25519_dalek::ristretto::RistrettoPoint;
 use curve25519_dalek::scalar::Scalar;
 use rand::RngCore;
 use serde::Serialize;
+use sha3::{Digest, Sha3_256};
 
 const BASE58_ALPHABET: &str = "123456789ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz";
 const BASE58_CHARS: &[u8] = BASE58_ALPHABET.as_bytes();
+const ADDRESS_PAYLOAD_BYTES: usize = 64; // spend_pub || view_pub
+const ADDRESS_CHECKSUM_BYTES: usize = 4; // first 4 bytes of SHA3-256
+const ADDRESS_BYTES: usize = ADDRESS_PAYLOAD_BYTES + ADDRESS_CHECKSUM_BYTES;
+const ADDRESS_BASE58_LENGTHS: [usize; 2] = [92, 93];
+const ADDRESS_CHECKSUM_TAG: &[u8] = b"blocknet_stealth_address_checksum";
+const ADDRESS_NETWORK_ID: &[u8] = b"blocknet_mainnet";
+
+type AddressNumber = [u8; ADDRESS_BYTES];
 
 /// Maximum number of generator table entries (supports batch up to 2^TABLE_BITS)
 const TABLE_BITS: usize = 24;
@@ -73,11 +82,11 @@ struct SearchConfig {
 // U512 big-endian arithmetic helpers (for range precomputation at startup)
 // ============================================================================
 
-/// Multiply a 64-byte big-endian number by a small u32 constant, in-place.
-/// Returns true if the result overflowed (didn't fit in 64 bytes).
-fn u512_mul_small(a: &mut [u8; 64], m: u32) -> bool {
+/// Multiply a fixed-width big-endian address number by a small u32 constant.
+/// Returns true if the result overflowed.
+fn u512_mul_small(a: &mut AddressNumber, m: u32) -> bool {
     let mut carry: u64 = 0;
-    for i in (0..64).rev() {
+    for i in (0..ADDRESS_BYTES).rev() {
         let prod = a[i] as u64 * m as u64 + carry;
         a[i] = prod as u8;
         carry = prod >> 8;
@@ -85,10 +94,10 @@ fn u512_mul_small(a: &mut [u8; 64], m: u32) -> bool {
     carry != 0
 }
 
-/// Add a single byte value to a 64-byte big-endian number, in-place.
-fn u512_add_small(a: &mut [u8; 64], v: u8) {
+/// Add a single byte value to a fixed-width big-endian address number.
+fn u512_add_small(a: &mut AddressNumber, v: u8) {
     let mut carry = v as u16;
-    for i in (0..64).rev() {
+    for i in (0..ADDRESS_BYTES).rev() {
         let sum = a[i] as u16 + carry;
         a[i] = sum as u8;
         carry = sum >> 8;
@@ -98,11 +107,11 @@ fn u512_add_small(a: &mut [u8; 64], v: u8) {
     }
 }
 
-/// Add two 64-byte big-endian numbers, returning the result (ignoring overflow).
-fn u512_add(a: &[u8; 64], b: &[u8; 64]) -> [u8; 64] {
-    let mut result = [0u8; 64];
+/// Add two fixed-width big-endian address numbers (ignoring overflow).
+fn u512_add(a: &AddressNumber, b: &AddressNumber) -> AddressNumber {
+    let mut result = [0u8; ADDRESS_BYTES];
     let mut carry: u16 = 0;
-    for i in (0..64).rev() {
+    for i in (0..ADDRESS_BYTES).rev() {
         let sum = a[i] as u16 + b[i] as u16 + carry;
         result[i] = sum as u8;
         carry = sum >> 8;
@@ -110,9 +119,9 @@ fn u512_add(a: &[u8; 64], b: &[u8; 64]) -> [u8; 64] {
     result
 }
 
-/// Compare two 64-byte big-endian numbers: returns Ordering.
-fn u512_cmp(a: &[u8; 64], b: &[u8; 64]) -> std::cmp::Ordering {
-    for i in 0..64 {
+/// Compare two fixed-width big-endian address numbers.
+fn u512_cmp(a: &AddressNumber, b: &AddressNumber) -> std::cmp::Ordering {
+    for i in 0..ADDRESS_BYTES {
         match a[i].cmp(&b[i]) {
             std::cmp::Ordering::Equal => continue,
             other => return other,
@@ -138,11 +147,11 @@ fn base58_char_values(c: u8) -> Vec<u8> {
     values
 }
 
-/// Compute the numeric ranges [lo, hi) of 64-byte big-endian values whose
+/// Compute the numeric ranges [lo, hi) of checksummed address-byte values whose
 /// base58 encoding starts with the given case-insensitive prefix.
 ///
 /// Returns a sorted, merged list of non-overlapping ranges.
-fn compute_prefix_ranges(prefix_lower: &str) -> Vec<([u8; 64], [u8; 64])> {
+fn compute_prefix_ranges(prefix_lower: &str) -> Vec<(AddressNumber, AddressNumber)> {
     if prefix_lower.is_empty() {
         return vec![];
     }
@@ -170,21 +179,21 @@ fn compute_prefix_ranges(prefix_lower: &str) -> Vec<([u8; 64], [u8; 64])> {
     }
 
     let p = prefix_bytes.len();
-    let mut ranges: Vec<([u8; 64], [u8; 64])> = Vec::new();
+    let mut ranges: Vec<(AddressNumber, AddressNumber)> = Vec::new();
 
-    // 2^512 as a ceiling (all 0xFF bytes = max value, but actual max is 2^512-1)
-    let max_val = [0xFFu8; 64];
+    // 2^(8*ADDRESS_BYTES) ceiling (all 0xFF bytes).
+    let max_val = [0xFFu8; ADDRESS_BYTES];
 
-    // Base58 encoding of 64 bytes produces 87 or 88 characters
-    for addr_len in [87usize, 88] {
+    // Base58 encoding of 68 bytes produces 92 or 93 characters.
+    for addr_len in ADDRESS_BASE58_LENGTHS {
         if p > addr_len {
             continue;
         }
         let remaining = addr_len - p;
 
         // Precompute 58^remaining (shared across combos for this addr_len)
-        let mut power = [0u8; 64];
-        power[63] = 1;
+        let mut power = [0u8; ADDRESS_BYTES];
+        power[ADDRESS_BYTES - 1] = 1;
         let mut power_overflow = false;
         for _ in 0..remaining {
             power_overflow |= u512_mul_small(&mut power, 58);
@@ -197,7 +206,7 @@ fn compute_prefix_ranges(prefix_lower: &str) -> Vec<([u8; 64], [u8; 64])> {
             // Compute lo = d[0]*58^(L-1) + d[1]*58^(L-2) + ... + d[P-1]*58^(L-P)
             // Using Horner's method: val = ((d[0]*58 + d[1])*58 + d[2])*58 + ...
             // then multiply by 58^(L-P)
-            let mut lo = [0u8; 64];
+            let mut lo = [0u8; ADDRESS_BYTES];
             let mut overflow = false;
             for &d in combo {
                 overflow |= u512_mul_small(&mut lo, 58);
@@ -234,7 +243,7 @@ fn compute_prefix_ranges(prefix_lower: &str) -> Vec<([u8; 64], [u8; 64])> {
     ranges.sort_by(|a, b| u512_cmp(&a.0, &b.0));
 
     // Merge overlapping ranges
-    let mut merged: Vec<([u8; 64], [u8; 64])> = Vec::new();
+    let mut merged: Vec<(AddressNumber, AddressNumber)> = Vec::new();
     for (lo, hi) in ranges {
         if let Some(last) = merged.last_mut() {
             // If current lo <= last hi, merge
@@ -304,47 +313,131 @@ fn compute_suffix_targets(suffix_lower: &str) -> (u64, Vec<u64>) {
     (modulus, targets)
 }
 
-/// Compute 256^32 mod m (the shift factor for splitting the 64-byte mod into two 32-byte halves)
-fn suffix_shift_mod(modulus: u64) -> u64 {
-    if modulus == 0 {
-        return 0;
-    }
-    let mut result: u64 = 1;
-    for _ in 0..32 {
-        result = ((result as u128 * 256) % modulus as u128) as u64;
-    }
-    result
+#[inline(always)]
+fn checksum_base_hasher() -> Sha3_256 {
+    let mut hasher = Sha3_256::new();
+    hasher.update(ADDRESS_CHECKSUM_TAG);
+    hasher.update(ADDRESS_NETWORK_ID);
+    hasher
 }
 
-/// Compute 256^8 mod m (used for 8-byte chunked suffix modulus accumulation)
-fn suffix_chunk_mul(modulus: u64) -> u64 {
-    if modulus == 0 {
-        return 0;
-    }
-    let mut result: u64 = 1;
-    for _ in 0..8 {
-        result = ((result as u128 * 256) % modulus as u128) as u64;
-    }
-    result
+#[inline(always)]
+fn checksum4_for_keys(
+    checksum_base: &Sha3_256,
+    spend_pub_bytes: &[u8; 32],
+    view_pub_bytes: &[u8; 32],
+) -> [u8; 4] {
+    let mut hasher = checksum_base.clone();
+    hasher.update(spend_pub_bytes);
+    hasher.update(view_pub_bytes);
+    let sum = hasher.finalize();
+    [sum[0], sum[1], sum[2], sum[3]]
 }
 
-/// Compute view_pub (as big-endian 32-byte number) mod suffix_modulus
-fn suffix_view_offset(view_pub_bytes: &[u8; 32], modulus: u64) -> u64 {
-    if modulus == 0 {
-        return 0;
+#[inline(always)]
+fn checksum4_for_keys_cached(
+    checksum_base: &Sha3_256,
+    spend_pub_bytes: &[u8; 32],
+    view_pub_bytes: &[u8; 32],
+    cache: &mut Option<[u8; 4]>,
+) -> [u8; 4] {
+    if let Some(sum) = *cache {
+        return sum;
     }
-    let mut result: u64 = 0;
+
+    let sum = checksum4_for_keys(checksum_base, spend_pub_bytes, view_pub_bytes);
+    *cache = Some(sum);
+    sum
+}
+
+#[inline(always)]
+fn write_address_bytes(
+    out: &mut AddressNumber,
+    spend_pub_bytes: &[u8; 32],
+    view_pub_bytes: &[u8; 32],
+    checksum4: &[u8; 4],
+) {
+    out[..32].copy_from_slice(spend_pub_bytes);
+    out[32..64].copy_from_slice(view_pub_bytes);
+    out[64..68].copy_from_slice(checksum4);
+}
+
+#[inline(always)]
+fn address_bytes_for_keys(
+    checksum_base: &Sha3_256,
+    spend_pub_bytes: &[u8; 32],
+    view_pub_bytes: &[u8; 32],
+) -> AddressNumber {
+    let mut out = [0u8; ADDRESS_BYTES];
+    let checksum4 = checksum4_for_keys(checksum_base, spend_pub_bytes, view_pub_bytes);
+    write_address_bytes(&mut out, spend_pub_bytes, view_pub_bytes, &checksum4);
+    out
+}
+
+#[inline(always)]
+#[allow(dead_code)]
+fn address_string_for_keys(
+    checksum_base: &Sha3_256,
+    spend_pub_bytes: &[u8; 32],
+    view_pub_bytes: &[u8; 32],
+) -> String {
+    let bytes = address_bytes_for_keys(checksum_base, spend_pub_bytes, view_pub_bytes);
+    bs58::encode(&bytes).into_string()
+}
+
+#[inline(always)]
+fn suffix_mod_for_address(
+    spend_pub_bytes: &[u8; 32],
+    view_pub_bytes: &[u8; 32],
+    checksum4: &[u8; 4],
+    modulus: u64,
+) -> u64 {
+    let mut v = 0u64;
+    for &b in spend_pub_bytes.iter() {
+        v = (v * 256 + b as u64) % modulus;
+    }
     for &b in view_pub_bytes.iter() {
-        result = (result * 256 + b as u64) % modulus;
+        v = (v * 256 + b as u64) % modulus;
     }
-    result
+    for &b in checksum4.iter() {
+        v = (v * 256 + b as u64) % modulus;
+    }
+    v
 }
 
 #[inline]
-fn cmp_combined_split_to_bound(
+fn cmp_address_split_to_bound(
     spend_pub_bytes: &[u8; 32],
     view_pub_bytes: &[u8; 32],
-    bound: &[u8; 64],
+    checksum4: &[u8; 4],
+    bound: &AddressNumber,
+) -> std::cmp::Ordering {
+    for i in 0..32 {
+        match spend_pub_bytes[i].cmp(&bound[i]) {
+            std::cmp::Ordering::Equal => {}
+            ord => return ord,
+        }
+    }
+    for i in 0..32 {
+        match view_pub_bytes[i].cmp(&bound[32 + i]) {
+            std::cmp::Ordering::Equal => {}
+            ord => return ord,
+        }
+    }
+    for i in 0..4 {
+        match checksum4[i].cmp(&bound[64 + i]) {
+            std::cmp::Ordering::Equal => {}
+            ord => return ord,
+        }
+    }
+    std::cmp::Ordering::Equal
+}
+
+#[inline]
+fn cmp_spend_view_split_to_bound(
+    spend_pub_bytes: &[u8; 32],
+    view_pub_bytes: &[u8; 32],
+    bound: &AddressNumber,
 ) -> std::cmp::Ordering {
     for i in 0..32 {
         match spend_pub_bytes[i].cmp(&bound[i]) {
@@ -362,10 +455,12 @@ fn cmp_combined_split_to_bound(
 }
 
 #[inline]
+#[allow(dead_code)]
 fn prefix_match_ranges_split(
     spend_pub_bytes: &[u8; 32],
     view_pub_bytes: &[u8; 32],
-    prefix_ranges: &[([u8; 64], [u8; 64])],
+    checksum4: &[u8; 4],
+    prefix_ranges: &[(AddressNumber, AddressNumber)],
 ) -> bool {
     if prefix_ranges.is_empty() {
         return true;
@@ -376,12 +471,12 @@ fn prefix_match_ranges_split(
     while left < right {
         let mid = left + ((right - left) >> 1);
         let (lo, hi) = &prefix_ranges[mid];
-        match cmp_combined_split_to_bound(spend_pub_bytes, view_pub_bytes, lo) {
+        match cmp_address_split_to_bound(spend_pub_bytes, view_pub_bytes, checksum4, lo) {
             std::cmp::Ordering::Less => {
                 right = mid;
             }
             _ => {
-                if cmp_combined_split_to_bound(spend_pub_bytes, view_pub_bytes, hi)
+                if cmp_address_split_to_bound(spend_pub_bytes, view_pub_bytes, checksum4, hi)
                     == std::cmp::Ordering::Less
                 {
                     return true;
@@ -389,6 +484,65 @@ fn prefix_match_ranges_split(
                 left = mid + 1;
             }
         }
+    }
+
+    false
+}
+
+#[inline]
+fn prefix_match_ranges_split_lazy_checksum(
+    checksum_base: &Sha3_256,
+    spend_pub_bytes: &[u8; 32],
+    view_pub_bytes: &[u8; 32],
+    checksum4_cache: &mut Option<[u8; 4]>,
+    prefix_ranges: &[(AddressNumber, AddressNumber)],
+) -> bool {
+    if prefix_ranges.is_empty() {
+        return true;
+    }
+
+    let mut left = 0usize;
+    let mut right = prefix_ranges.len();
+    while left < right {
+        let mid = left + ((right - left) >> 1);
+        let (lo, hi) = &prefix_ranges[mid];
+
+        let cmp_lo = match cmp_spend_view_split_to_bound(spend_pub_bytes, view_pub_bytes, lo) {
+            std::cmp::Ordering::Equal => {
+                let checksum4 = checksum4_for_keys_cached(
+                    checksum_base,
+                    spend_pub_bytes,
+                    view_pub_bytes,
+                    checksum4_cache,
+                );
+                cmp_address_split_to_bound(spend_pub_bytes, view_pub_bytes, &checksum4, lo)
+            }
+            ord => ord,
+        };
+
+        if cmp_lo == std::cmp::Ordering::Less {
+            right = mid;
+            continue;
+        }
+
+        let cmp_hi = match cmp_spend_view_split_to_bound(spend_pub_bytes, view_pub_bytes, hi) {
+            std::cmp::Ordering::Equal => {
+                let checksum4 = checksum4_for_keys_cached(
+                    checksum_base,
+                    spend_pub_bytes,
+                    view_pub_bytes,
+                    checksum4_cache,
+                );
+                cmp_address_split_to_bound(spend_pub_bytes, view_pub_bytes, &checksum4, hi)
+            }
+            ord => ord,
+        };
+
+        if cmp_hi == std::cmp::Ordering::Less {
+            return true;
+        }
+
+        left = mid + 1;
     }
 
     false
@@ -479,20 +633,15 @@ fn fe_sq(f: &[u64; 5]) -> [u64; 5] {
     let (f0, f1, f2, f3, f4) = (f[0], f[1], f[2], f[3], f[4]);
     let f0_2 = f0 * 2;
     let f1_2 = f1 * 2;
-    let h0: u128 = f0 as u128 * f0 as u128
-        + (f1 * 38) as u128 * f4 as u128
-        + (f2 * 38) as u128 * f3 as u128;
-    let h1: u128 = f0_2 as u128 * f1 as u128
-        + (f2 * 38) as u128 * f4 as u128
-        + (f3 * 19) as u128 * f3 as u128;
-    let h2: u128 = f0_2 as u128 * f2 as u128
-        + f1 as u128 * f1 as u128
-        + (f3 * 38) as u128 * f4 as u128;
-    let h3: u128 = f0_2 as u128 * f3 as u128
-        + f1_2 as u128 * f2 as u128
-        + (f4 * 19) as u128 * f4 as u128;
-    let h4: u128 =
-        f0_2 as u128 * f4 as u128 + f1_2 as u128 * f3 as u128 + f2 as u128 * f2 as u128;
+    let h0: u128 =
+        f0 as u128 * f0 as u128 + (f1 * 38) as u128 * f4 as u128 + (f2 * 38) as u128 * f3 as u128;
+    let h1: u128 =
+        f0_2 as u128 * f1 as u128 + (f2 * 38) as u128 * f4 as u128 + (f3 * 19) as u128 * f3 as u128;
+    let h2: u128 =
+        f0_2 as u128 * f2 as u128 + f1 as u128 * f1 as u128 + (f3 * 38) as u128 * f4 as u128;
+    let h3: u128 =
+        f0_2 as u128 * f3 as u128 + f1_2 as u128 * f2 as u128 + (f4 * 19) as u128 * f4 as u128;
+    let h4: u128 = f0_2 as u128 * f4 as u128 + f1_2 as u128 * f3 as u128 + f2 as u128 * f2 as u128;
     let mask: u64 = (1u64 << 51) - 1;
     let c = (h0 >> 51) as u64;
     let v0 = h0 as u64 & mask;
@@ -729,16 +878,15 @@ const INVSQRT_A_MINUS_D: [u64; 5] = [
 // Precomputed byte representations for sqrt_ratio check comparisons
 // (avoids 3x fe_equal_fast — one fe_tobytes + 3 byte comparisons instead)
 const ONE_BYTES: [u8; 32] = [
-    1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
-    0, 0,
+    1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
 ];
 const NEG_ONE_BYTES: [u8; 32] = [
     236, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255,
     255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 127,
 ];
 const NEG_SQRT_M1_BYTES: [u8; 32] = [
-    61, 95, 241, 181, 216, 228, 17, 59, 135, 27, 208, 82, 249, 231, 188, 208, 88, 40, 4, 194,
-    102, 255, 178, 212, 244, 32, 62, 176, 127, 219, 124, 84,
+    61, 95, 241, 181, 216, 228, 17, 59, 135, 27, 208, 82, 249, 231, 188, 208, 88, 40, 4, 194, 102,
+    255, 178, 212, 244, 32, 62, 176, 127, 219, 124, 84,
 ];
 
 /// Custom Ristretto point compression — bypasses curve25519-dalek abstractions.
@@ -933,7 +1081,19 @@ fn compress_pre(point: &[[u64; 5]; 4]) -> (CompressIntermediate, [u64; 5]) {
     let v3_sq = fe_sq(&v3);
     let v7 = fe_mul(&v3_sq, &v);
 
-    (CompressIntermediate { v3, v, u1, u2, x, y, z, t }, v7)
+    (
+        CompressIntermediate {
+            v3,
+            v,
+            u1,
+            u2,
+            x,
+            y,
+            z,
+            t,
+        },
+        v7,
+    )
 }
 
 /// Post-phase of Ristretto compression: given the fe_pow22523 result, finish encoding.
@@ -1234,7 +1394,6 @@ impl SearchBackend for CpuBackend {
             compute_prefix_ranges(&config.prefix_lower)
         };
         let (suffix_modulus, suffix_targets) = compute_suffix_targets(&config.suffix_lower);
-        let suffix_shift = suffix_shift_mod(suffix_modulus);
         let prefix_ranges = Arc::new(prefix_ranges);
         let suffix_targets = Arc::new(suffix_targets);
         let prefix_bytes = Arc::<[u8]>::from(config.prefix_lower.as_bytes());
@@ -1269,28 +1428,35 @@ impl SearchBackend for CpuBackend {
                 ];
                 let mut point_b = edwards_add_basepoint(&point_a); // B starts 1 ahead
                 let mut local_count: u64 = 0;
-                let mut combined = [0u8; 64];
-                let mut address_bytes = [0u8; 96];
-                combined[32..].copy_from_slice(&view_pub_bytes);
-                let suffix_view_mod = suffix_view_offset(&view_pub_bytes, suffix_modulus);
+                let mut combined = [0u8; ADDRESS_BYTES];
+                let mut address_bytes = [0u8; 128];
+                let checksum_base = checksum_base_hasher();
 
                 // Closure: check a compressed key for match and send result
-                let mut check_match = |spend_pub_bytes: &[u8; 32],
-                                       offset: u64|
-                 -> bool {
+                let mut check_match = |spend_pub_bytes: &[u8; 32], offset: u64| -> bool {
                     let mut matched_address: Option<String> = None;
+                    let mut checksum4_cache: Option<[u8; 4]> = None;
 
                     if use_legacy_base58_matcher {
-                        combined[..32].copy_from_slice(spend_pub_bytes);
+                        let checksum4 = checksum4_for_keys_cached(
+                            &checksum_base,
+                            spend_pub_bytes,
+                            &view_pub_bytes,
+                            &mut checksum4_cache,
+                        );
+                        write_address_bytes(
+                            &mut combined,
+                            spend_pub_bytes,
+                            &view_pub_bytes,
+                            &checksum4,
+                        );
                         let encoded_len = bs58::encode(&combined)
                             .onto(&mut address_bytes[..])
                             .expect("encoding to byte buffer cannot fail");
 
                         let address_view = &address_bytes[..encoded_len];
-                        let prefix_ok =
-                            starts_with_ascii_lowered(address_view, &prefix_bytes);
-                        let suffix_ok =
-                            ends_with_ascii_lowered(address_view, &suffix_bytes);
+                        let prefix_ok = starts_with_ascii_lowered(address_view, &prefix_bytes);
+                        let suffix_ok = ends_with_ascii_lowered(address_view, &suffix_bytes);
 
                         if prefix_ok && suffix_ok {
                             matched_address = Some(
@@ -1300,32 +1466,46 @@ impl SearchBackend for CpuBackend {
                             );
                         }
                     } else {
-                        let prefix_ok = prefix_match_ranges_split(
+                        let prefix_ok = prefix_match_ranges_split_lazy_checksum(
+                            &checksum_base,
                             spend_pub_bytes,
                             &view_pub_bytes,
+                            &mut checksum4_cache,
                             &prefix_ranges,
                         );
 
                         let suffix_ok = if !prefix_ok || suffix_targets.is_empty() {
                             prefix_ok
                         } else {
-                            let mut spend_mod: u64 = 0;
-                            for &byte in spend_pub_bytes.iter() {
-                                spend_mod =
-                                    (spend_mod * 256 + byte as u64) % suffix_modulus;
-                            }
-                            let mod_val = ((spend_mod as u128
-                                * suffix_shift as u128
-                                + suffix_view_mod as u128)
-                                % suffix_modulus as u128)
-                                as u64;
+                            let checksum4 = checksum4_for_keys_cached(
+                                &checksum_base,
+                                spend_pub_bytes,
+                                &view_pub_bytes,
+                                &mut checksum4_cache,
+                            );
+                            let mod_val = suffix_mod_for_address(
+                                spend_pub_bytes,
+                                &view_pub_bytes,
+                                &checksum4,
+                                suffix_modulus,
+                            );
                             suffix_targets.binary_search(&mod_val).is_ok()
                         };
 
                         if prefix_ok && suffix_ok {
-                            combined[..32].copy_from_slice(spend_pub_bytes);
-                            matched_address =
-                                Some(bs58::encode(&combined).into_string());
+                            let checksum4 = checksum4_for_keys_cached(
+                                &checksum_base,
+                                spend_pub_bytes,
+                                &view_pub_bytes,
+                                &mut checksum4_cache,
+                            );
+                            write_address_bytes(
+                                &mut combined,
+                                spend_pub_bytes,
+                                &view_pub_bytes,
+                                &checksum4,
+                            );
+                            matched_address = Some(bs58::encode(&combined).into_string());
                         }
                     }
 
@@ -1418,9 +1598,6 @@ unsafe extern "C" {
         suffix_modulus: u64,
         suffix_targets: *const u64,
         num_suffix_targets: i32,
-        suffix_shift_mod: u64,
-        suffix_chunk_mul: u64,
-        suffix_view_offset: u64,
     ) -> i32;
 
     fn cuda_worker_submit_v2(
@@ -1593,7 +1770,8 @@ impl SearchBackend for CudaBackend {
             let prefix_ranges = compute_prefix_ranges(&config.prefix_lower);
             let (suffix_modulus, suffix_targets) = compute_suffix_targets(&config.suffix_lower);
 
-            // Flatten prefix ranges into contiguous bytes: [lo0[64] hi0[64] lo1[64] hi1[64] ...]
+            // Flatten prefix ranges into contiguous bytes:
+            // [lo0[68] hi0[68] lo1[68] hi1[68] ...]
             let prefix_ranges_flat: Vec<u8> = prefix_ranges
                 .iter()
                 .flat_map(|(lo, hi)| lo.iter().chain(hi.iter()).copied())
@@ -1654,9 +1832,6 @@ impl SearchBackend for CudaBackend {
                     }
 
                     // Upload precomputed ranges to GPU
-                    let shift_mod = suffix_shift_mod(suffix_modulus);
-                    let chunk_mul = suffix_chunk_mul(suffix_modulus);
-                    let view_offset = suffix_view_offset(&view_pub_bytes, suffix_modulus);
                     let rc = unsafe {
                         cuda_worker_set_ranges(
                             handle,
@@ -1673,9 +1848,6 @@ impl SearchBackend for CudaBackend {
                                 suffix_targets.as_ptr()
                             },
                             suffix_targets.len() as i32,
-                            shift_mod,
-                            chunk_mul,
-                            view_offset,
                         )
                     };
                     if rc != 0 {
@@ -1685,6 +1857,8 @@ impl SearchBackend for CudaBackend {
 
                     // Get pointer to pinned host flag buffer (allocated by CUDA)
                     let flags_ptr = unsafe { cuda_worker_get_flags(handle) };
+                    let checksum_base = checksum_base_hasher();
+                    let mut combined = [0u8; ADDRESS_BYTES];
 
                     loop {
                         // Extract starting point coordinates
@@ -1721,9 +1895,17 @@ impl SearchBackend for CudaBackend {
                             let match_pub = (&match_priv * RISTRETTO_BASEPOINT_TABLE).compress();
                             let match_pub_bytes = match_pub.to_bytes();
 
-                            let mut combined = [0u8; 64];
-                            combined[..32].copy_from_slice(&match_pub_bytes);
-                            combined[32..].copy_from_slice(&view_pub_bytes);
+                            let checksum4 = checksum4_for_keys(
+                                &checksum_base,
+                                &match_pub_bytes,
+                                &view_pub_bytes,
+                            );
+                            write_address_bytes(
+                                &mut combined,
+                                &match_pub_bytes,
+                                &view_pub_bytes,
+                                &checksum4,
+                            );
                             let address = bs58::encode(&combined).into_string();
 
                             let wallet = VanityWallet {
@@ -2129,16 +2311,14 @@ mod tests {
 
         let spend_pub = (&spend_priv * RISTRETTO_BASEPOINT_TABLE).compress();
         let view_pub = (&view_priv * RISTRETTO_BASEPOINT_TABLE).compress();
-
-        let mut combined = [0u8; 64];
-        combined[..32].copy_from_slice(spend_pub.as_bytes());
-        combined[32..].copy_from_slice(view_pub.as_bytes());
-
+        let checksum_base = checksum_base_hasher();
+        let combined =
+            address_bytes_for_keys(&checksum_base, spend_pub.as_bytes(), view_pub.as_bytes());
         let address = bs58::encode(&combined).into_string();
 
-        // Address should be valid base58 and reasonable length (~87 chars for 64 bytes)
+        // Address should be valid base58 and reasonable length (~92-93 chars for 68 bytes)
         assert!(
-            address.len() >= 80 && address.len() <= 90,
+            address.len() >= 90 && address.len() <= 95,
             "address length {} outside expected range",
             address.len()
         );
@@ -2380,9 +2560,6 @@ mod tests {
                 0, // no suffix
                 std::ptr::null(),
                 0,
-                0,
-                0,
-                0,
             )
         };
         assert_eq!(rc, 0, "cuda_worker_set_ranges failed");
@@ -2402,18 +2579,15 @@ mod tests {
 
         let flags =
             unsafe { std::slice::from_raw_parts(cuda_worker_get_flags(handle), batch_size) };
+        let checksum_base = checksum_base_hasher();
 
         // Verify every GPU match/non-match against CPU
         let mut match_count = 0;
         for i in 0..batch_size {
             let priv_i = start_scalar + Scalar::from(i as u64);
             let pub_i = (&priv_i * RISTRETTO_BASEPOINT_TABLE).compress();
-
-            let mut combined = [0u8; 64];
-            combined[..32].copy_from_slice(pub_i.as_bytes());
-            combined[32..].copy_from_slice(&view_pub_bytes);
-
-            let address = bs58::encode(&combined).into_string();
+            let address =
+                address_string_for_keys(&checksum_base, pub_i.as_bytes(), &view_pub_bytes);
             let cpu_match = address.to_ascii_lowercase().starts_with(prefix);
 
             let gpu_match = flags[i] != 0;
@@ -3738,42 +3912,45 @@ mod tests {
 
     #[test]
     fn test_u512_mul_small() {
-        let mut a = [0u8; 64];
-        a[63] = 58;
+        let mut a = [0u8; ADDRESS_BYTES];
+        let last = ADDRESS_BYTES - 1;
+        a[last] = 58;
         u512_mul_small(&mut a, 58);
         // 58 * 58 = 3364 = 0x0D24
-        assert_eq!(a[62], 0x0D);
-        assert_eq!(a[63], 0x24);
+        assert_eq!(a[last - 1], 0x0D);
+        assert_eq!(a[last], 0x24);
     }
 
     #[test]
     fn test_u512_add_small() {
-        let mut a = [0u8; 64];
-        a[63] = 255;
+        let mut a = [0u8; ADDRESS_BYTES];
+        let last = ADDRESS_BYTES - 1;
+        a[last] = 255;
         u512_add_small(&mut a, 1);
-        assert_eq!(a[63], 0);
-        assert_eq!(a[62], 1);
+        assert_eq!(a[last], 0);
+        assert_eq!(a[last - 1], 1);
     }
 
     #[test]
     fn test_u512_add() {
-        let mut a = [0u8; 64];
-        let mut b = [0u8; 64];
-        a[63] = 200;
-        b[63] = 100;
+        let mut a = [0u8; ADDRESS_BYTES];
+        let mut b = [0u8; ADDRESS_BYTES];
+        let last = ADDRESS_BYTES - 1;
+        a[last] = 200;
+        b[last] = 100;
         let result = u512_add(&a, &b);
         // 200 + 100 = 300 = 0x012C
-        assert_eq!(result[62], 1);
-        assert_eq!(result[63], 0x2C);
+        assert_eq!(result[last - 1], 1);
+        assert_eq!(result[last], 0x2C);
     }
 
     #[test]
     fn test_u512_cmp() {
-        let a = [0u8; 64];
-        let b = [0u8; 64];
+        let a = [0u8; ADDRESS_BYTES];
+        let b = [0u8; ADDRESS_BYTES];
         assert_eq!(u512_cmp(&a, &b), std::cmp::Ordering::Equal);
 
-        let mut c = [0u8; 64];
+        let mut c = [0u8; ADDRESS_BYTES];
         c[0] = 1;
         assert_eq!(u512_cmp(&c, &a), std::cmp::Ordering::Greater);
         assert_eq!(u512_cmp(&a, &c), std::cmp::Ordering::Less);
@@ -3819,6 +3996,7 @@ mod tests {
         let mut rng = rand::thread_rng();
         let prefix = "te";
         let ranges = compute_prefix_ranges(prefix);
+        let checksum_base = checksum_base_hasher();
 
         for _ in 0..1000 {
             let spend_priv = random_scalar(&mut rng);
@@ -3826,9 +4004,9 @@ mod tests {
             let spend_pub = (&spend_priv * RISTRETTO_BASEPOINT_TABLE).compress();
             let view_pub = (&view_priv * RISTRETTO_BASEPOINT_TABLE).compress();
 
-            let mut combined = [0u8; 64];
-            combined[..32].copy_from_slice(spend_pub.as_bytes());
-            combined[32..].copy_from_slice(view_pub.as_bytes());
+            let combined =
+                address_bytes_for_keys(&checksum_base, spend_pub.as_bytes(), view_pub.as_bytes());
+            let checksum4 = [combined[64], combined[65], combined[66], combined[67]];
 
             let address = bs58::encode(&combined).into_string();
             let bs58_match = address.to_ascii_lowercase().starts_with(prefix);
@@ -3838,8 +4016,12 @@ mod tests {
                 u512_cmp(&combined, lo) != std::cmp::Ordering::Less
                     && u512_cmp(&combined, hi) == std::cmp::Ordering::Less
             });
-            let range_match_split =
-                prefix_match_ranges_split(spend_pub.as_bytes(), view_pub.as_bytes(), &ranges);
+            let range_match_split = prefix_match_ranges_split(
+                spend_pub.as_bytes(),
+                view_pub.as_bytes(),
+                &checksum4,
+                &ranges,
+            );
 
             assert_eq!(
                 range_match, bs58_match,
@@ -3866,6 +4048,7 @@ mod tests {
         let mut rng = rand::thread_rng();
         let suffix = "z";
         let (modulus, targets) = compute_suffix_targets(suffix);
+        let checksum_base = checksum_base_hasher();
 
         for _ in 0..1000 {
             let spend_priv = random_scalar(&mut rng);
@@ -3873,9 +4056,8 @@ mod tests {
             let spend_pub = (&spend_priv * RISTRETTO_BASEPOINT_TABLE).compress();
             let view_pub = (&view_priv * RISTRETTO_BASEPOINT_TABLE).compress();
 
-            let mut combined = [0u8; 64];
-            combined[..32].copy_from_slice(spend_pub.as_bytes());
-            combined[32..].copy_from_slice(view_pub.as_bytes());
+            let combined =
+                address_bytes_for_keys(&checksum_base, spend_pub.as_bytes(), view_pub.as_bytes());
 
             let address = bs58::encode(&combined).into_string();
             let bs58_match = address.to_ascii_lowercase().ends_with(suffix);
@@ -3947,9 +4129,6 @@ mod tests {
                 0, // no suffix
                 std::ptr::null(),
                 0,
-                0,
-                0,
-                0,
             )
         };
         assert_eq!(rc, 0, "cuda_worker_set_ranges failed");
@@ -3969,6 +4148,7 @@ mod tests {
 
         let flags =
             unsafe { std::slice::from_raw_parts(cuda_worker_get_flags(handle), batch_size) };
+        let checksum_base = checksum_base_hasher();
 
         // Verify every GPU match/non-match against CPU
         let mut match_count = 0;
@@ -3976,11 +4156,8 @@ mod tests {
             let priv_i = start_scalar + Scalar::from(i as u64);
             let pub_i = (&priv_i * RISTRETTO_BASEPOINT_TABLE).compress();
 
-            let mut combined = [0u8; 64];
-            combined[..32].copy_from_slice(pub_i.as_bytes());
-            combined[32..].copy_from_slice(&view_pub_bytes);
-
-            let address = bs58::encode(&combined).into_string();
+            let address =
+                address_string_for_keys(&checksum_base, pub_i.as_bytes(), &view_pub_bytes);
             let cpu_match = address.to_ascii_lowercase().starts_with(prefix);
 
             let gpu_match = flags[i] != 0;
@@ -4028,6 +4205,7 @@ mod tests {
         let suffixes = ["a", "b", "2"];
         let batch_size = 4096;
         let mut total_match_count = 0;
+        let checksum_base = checksum_base_hasher();
 
         for suffix in &suffixes {
             let (suffix_modulus, suffix_targets) = compute_suffix_targets(suffix);
@@ -4047,9 +4225,6 @@ mod tests {
             };
             assert!(!handle.is_null());
 
-            let shift_mod = suffix_shift_mod(suffix_modulus);
-            let chunk_mul = suffix_chunk_mul(suffix_modulus);
-            let view_offset = suffix_view_offset(&view_pub_bytes, suffix_modulus);
             let rc = unsafe {
                 cuda_worker_set_ranges(
                     handle,
@@ -4058,9 +4233,6 @@ mod tests {
                     suffix_modulus,
                     suffix_targets.as_ptr(),
                     suffix_targets.len() as i32,
-                    shift_mod,
-                    chunk_mul,
-                    view_offset,
                 )
             };
             assert_eq!(rc, 0, "cuda_worker_set_ranges failed");
@@ -4086,11 +4258,8 @@ mod tests {
                 let priv_i = start_scalar + Scalar::from(i as u64);
                 let pub_i = (&priv_i * RISTRETTO_BASEPOINT_TABLE).compress();
 
-                let mut combined = [0u8; 64];
-                combined[..32].copy_from_slice(pub_i.as_bytes());
-                combined[32..].copy_from_slice(&view_pub_bytes);
-
-                let address = bs58::encode(&combined).into_string();
+                let address =
+                    address_string_for_keys(&checksum_base, pub_i.as_bytes(), &view_pub_bytes);
                 let cpu_match = address.to_ascii_lowercase().ends_with(*suffix);
                 let gpu_match = flags[i] != 0;
 
