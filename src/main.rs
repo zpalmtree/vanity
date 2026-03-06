@@ -1962,14 +1962,26 @@ fn random_scalar(rng: &mut impl RngCore) -> Scalar {
 
 /// Check if every character in the pattern could appear in a base58 string
 /// (case-insensitive: 'l' is valid because 'L' exists in base58, etc.)
-fn validate_pattern(s: &str) -> Result<(), char> {
+/// Returns Err(char) for truly invalid characters, or Ok with a list of
+/// characters that aren't directly in base58 but match case-insensitively.
+fn validate_pattern(s: &str) -> Result<Vec<(char, char)>, char> {
     let lower = BASE58_ALPHABET.to_ascii_lowercase();
+    let mut substitutions = Vec::new();
     for c in s.chars() {
         if !lower.contains(c.to_ascii_lowercase()) {
             return Err(c);
         }
+        // Check if this exact character is NOT in base58 (but its case-flipped version is)
+        if !BASE58_ALPHABET.contains(c) {
+            let flipped = if c.is_ascii_lowercase() {
+                c.to_ascii_uppercase()
+            } else {
+                c.to_ascii_lowercase()
+            };
+            substitutions.push((c, flipped));
+        }
     }
-    Ok(())
+    Ok(substitutions)
 }
 
 #[inline]
@@ -2086,24 +2098,44 @@ fn main() {
     }
 
     if !args.prefix.is_empty() {
-        if let Err(c) = validate_pattern(&args.prefix) {
-            eprintln!(
-                "error: prefix contains '{}' which is not a valid base58 character",
-                c
-            );
-            eprintln!("       base58 excludes: 0 (zero), O (uppercase o), I (uppercase i), l (lowercase L)");
-            std::process::exit(1);
+        match validate_pattern(&args.prefix) {
+            Err(c) => {
+                eprintln!(
+                    "error: prefix contains '{}' which is not a valid base58 character",
+                    c
+                );
+                eprintln!("       base58 excludes: 0 (zero), O (uppercase o), I (uppercase i), l (lowercase L)");
+                std::process::exit(1);
+            }
+            Ok(subs) => {
+                for (from, to) in &subs {
+                    eprintln!(
+                        "  note: '{}' is not in base58; matching '{}' instead (case-insensitive)",
+                        from, to
+                    );
+                }
+            }
         }
     }
 
     if !args.suffix.is_empty() {
-        if let Err(c) = validate_pattern(&args.suffix) {
-            eprintln!(
-                "error: suffix contains '{}' which is not a valid base58 character",
-                c
-            );
-            eprintln!("       base58 excludes: 0 (zero), O (uppercase o), I (uppercase i), l (lowercase L)");
-            std::process::exit(1);
+        match validate_pattern(&args.suffix) {
+            Err(c) => {
+                eprintln!(
+                    "error: suffix contains '{}' which is not a valid base58 character",
+                    c
+                );
+                eprintln!("       base58 excludes: 0 (zero), O (uppercase o), I (uppercase i), l (lowercase L)");
+                std::process::exit(1);
+            }
+            Ok(subs) => {
+                for (from, to) in &subs {
+                    eprintln!(
+                        "  note: '{}' is not in base58; matching '{}' instead (case-insensitive)",
+                        from, to
+                    );
+                }
+            }
         }
     }
 
@@ -2289,6 +2321,8 @@ mod tests {
         assert!(validate_pattern("123").is_ok());
         assert!(validate_pattern("ABCdef").is_ok());
         assert!(validate_pattern("z").is_ok());
+        // Direct base58 chars have no substitutions
+        assert_eq!(validate_pattern("abc").unwrap().len(), 0);
     }
 
     #[test]
@@ -2296,10 +2330,22 @@ mod tests {
         assert!(validate_pattern("0").is_err()); // zero not in base58
         assert!(validate_pattern("!").is_err()); // symbol not in base58
         assert!(validate_pattern(" ").is_err()); // space not in base58
-                                                 // O, I, l are valid for case-insensitive search (match o, i, L)
-        assert!(validate_pattern("O").is_ok());
-        assert!(validate_pattern("I").is_ok());
-        assert!(validate_pattern("l").is_ok());
+    }
+
+    #[test]
+    fn test_validate_pattern_substitutions() {
+        // O is not in base58, but o is — should report substitution
+        let subs = validate_pattern("O").unwrap();
+        assert_eq!(subs, vec![('O', 'o')]);
+        // I is not in base58, but i is
+        let subs = validate_pattern("I").unwrap();
+        assert_eq!(subs, vec![('I', 'i')]);
+        // l is not in base58, but L is
+        let subs = validate_pattern("l").unwrap();
+        assert_eq!(subs, vec![('l', 'L')]);
+        // pool: 'l' substituted, others fine
+        let subs = validate_pattern("pool").unwrap();
+        assert_eq!(subs, vec![('l', 'L')]);
     }
 
     #[test]
