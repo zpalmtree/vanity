@@ -12,7 +12,7 @@ use clap::Parser;
 #[cfg(any(test, all(feature = "cuda", target_os = "linux")))]
 use curve25519_dalek::constants::RISTRETTO_BASEPOINT_POINT;
 use curve25519_dalek::constants::RISTRETTO_BASEPOINT_TABLE;
-use curve25519_dalek::ristretto::RistrettoPoint;
+use curve25519_dalek::ristretto::{CompressedRistretto, RistrettoPoint};
 use curve25519_dalek::scalar::Scalar;
 use rand::RngCore;
 use serde::Serialize;
@@ -395,6 +395,76 @@ fn address_string_for_keys(
 ) -> String {
     let bytes = address_bytes_for_keys(checksum_base, spend_pub_bytes, view_pub_bytes);
     bs58::encode(&bytes).into_string()
+}
+
+fn validate_address(address: &str) -> Result<([u8; 32], [u8; 32]), String> {
+    let decoded = bs58::decode(address)
+        .into_vec()
+        .map_err(|_| "invalid base58 address".to_string())?;
+    if decoded.len() != ADDRESS_BYTES {
+        return Err(format!(
+            "invalid decoded address length: expected {}, got {}",
+            ADDRESS_BYTES,
+            decoded.len()
+        ));
+    }
+
+    let mut spend_pub = [0u8; 32];
+    let mut view_pub = [0u8; 32];
+    spend_pub.copy_from_slice(&decoded[..32]);
+    view_pub.copy_from_slice(&decoded[32..64]);
+
+    let checksum_base = checksum_base_hasher();
+    let checksum4 = checksum4_for_keys(&checksum_base, &spend_pub, &view_pub);
+    if decoded[64..68] != checksum4 {
+        return Err("invalid address checksum".to_string());
+    }
+
+    if CompressedRistretto(spend_pub).decompress().is_none() {
+        return Err("invalid spend public key".to_string());
+    }
+    if CompressedRistretto(view_pub).decompress().is_none() {
+        return Err("invalid view public key".to_string());
+    }
+
+    Ok((spend_pub, view_pub))
+}
+
+fn validate_vanity_wallet(wallet: &VanityWallet) -> Result<(), String> {
+    let (spend_pub, view_pub) = validate_address(&wallet.address)?;
+    if wallet.spend_public_key != hex::encode(spend_pub) {
+        return Err("address does not match spend_public_key".to_string());
+    }
+    if wallet.view_public_key != hex::encode(view_pub) {
+        return Err("address does not match view_public_key".to_string());
+    }
+
+    let spend_priv = decode_scalar_hex("spend_private_key", &wallet.spend_private_key)?;
+    let view_priv = decode_scalar_hex("view_private_key", &wallet.view_private_key)?;
+    let derived_spend_pub = (&spend_priv * RISTRETTO_BASEPOINT_TABLE).compress();
+    let derived_view_pub = (&view_priv * RISTRETTO_BASEPOINT_TABLE).compress();
+    if derived_spend_pub.to_bytes() != spend_pub {
+        return Err("spend_private_key does not derive spend_public_key".to_string());
+    }
+    if derived_view_pub.to_bytes() != view_pub {
+        return Err("view_private_key does not derive view_public_key".to_string());
+    }
+
+    Ok(())
+}
+
+fn decode_scalar_hex(label: &str, value: &str) -> Result<Scalar, String> {
+    let bytes = hex::decode(value).map_err(|_| format!("{label} is not valid hex"))?;
+    if bytes.len() != 32 {
+        return Err(format!(
+            "{label} must be 32 bytes, got {} bytes",
+            bytes.len()
+        ));
+    }
+    let mut array = [0u8; 32];
+    array.copy_from_slice(&bytes);
+    Option::<Scalar>::from(Scalar::from_canonical_bytes(array))
+        .ok_or_else(|| format!("{label} is not a canonical scalar"))
 }
 
 #[inline(always)]
@@ -2048,6 +2118,14 @@ fn spawn_writer_thread(
 ) -> thread::JoinHandle<()> {
     thread::spawn(move || {
         for wallet in rx {
+            if let Err(err) = validate_vanity_wallet(&wallet) {
+                eprintln!(
+                    "\r\x1b[Kerror: generated invalid wallet {}: {}\n",
+                    wallet.address, err
+                );
+                continue;
+            }
+
             let address = wallet.address.clone();
             let json = serde_json::to_string_pretty(&wallet).unwrap();
             let path = format!("{}/{}.json", output_dir, address);
@@ -2344,6 +2422,37 @@ mod tests {
         // Round-trip: decode and re-encode should match
         let decoded = bs58::decode(&address).into_vec().unwrap();
         assert_eq!(decoded, combined.to_vec());
+        assert!(validate_address(&address).is_ok());
+    }
+
+    #[test]
+    fn test_validate_address_rejects_checksum_valid_invalid_ristretto_keys() {
+        let address = "S7YPHt98NDKrUNmFaHa9GQu4XJvRPkTR51bxdE4122UFxfB4cqdFP5R2pkJSrNTQGwmFVmKzKodu7F8XmHjTTx9PNx3i";
+        let err = validate_address(address).expect_err("invalid Ristretto keys must be rejected");
+        assert!(
+            err.contains("public key"),
+            "expected public key validation error, got {err}"
+        );
+    }
+
+    #[test]
+    fn test_validate_vanity_wallet_accepts_generated_wallet() {
+        let spend_priv = Scalar::from(12345u64);
+        let view_priv = Scalar::from(67890u64);
+        let spend_pub = (&spend_priv * RISTRETTO_BASEPOINT_TABLE).compress();
+        let view_pub = (&view_priv * RISTRETTO_BASEPOINT_TABLE).compress();
+        let checksum_base = checksum_base_hasher();
+        let address =
+            address_string_for_keys(&checksum_base, spend_pub.as_bytes(), view_pub.as_bytes());
+        let wallet = VanityWallet {
+            address,
+            spend_private_key: hex::encode(spend_priv.as_bytes()),
+            spend_public_key: hex::encode(spend_pub.as_bytes()),
+            view_private_key: hex::encode(view_priv.as_bytes()),
+            view_public_key: hex::encode(view_pub.as_bytes()),
+        };
+
+        validate_vanity_wallet(&wallet).expect("generated wallet should validate");
     }
 
     #[test]
